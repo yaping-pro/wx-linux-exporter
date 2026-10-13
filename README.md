@@ -12,14 +12,6 @@
 
 ---
 
-## 家族项目 / Sibling Projects
-
-本项目是微信个人知识库与 AI 助理导出家族的三部曲之一：
-1. **[`yaping-pro/wx-tablet-mode`](https://github.com/yaping-pro/wx-tablet-mode)** (GPL-3.0) — 安卓微信平板模式登录资格赋予与外观伪装 Xposed 模块。
-2. **[`yaping-pro/wx-pad-exporter`](https://github.com/yaping-pro/wx-pad-exporter)** (MIT) — 手机/平板端微信实时聊天流只读导出守护进程 + Webhook 桥接（数据出口格式与本项目 100% 保持一致）。
-3. **`yaping-pro/wx-linux-exporter`** (MIT, 本仓库) — **Linux / Homelab 原生微信定时解密、WAL 二进制合并、原子版本发布与只读快照导出服务（基准参考实现）**。
-
----
 
 ## 中文
 
@@ -33,6 +25,7 @@
 - [🤖 接入个人 AI 助理 (Muse 早报 / Webhook)](#-接入个人-ai-助理-muse-早报--webhook)
 - [📊 数据契约与导出 Schema](#-数据契约与导出-schema)
 - [❓ 常见问题与排错指南 (FAQ)](#-常见问题与排错指南-faq)
+- [🤝 兄弟项目 (Sibling Projects)](#-兄弟项目-sibling-projects)
 - [💬 交流群 / Community](#-交流群--community)
 - [🔒 安全政策与免责声明](#-安全政策与免责声明)
 - [📄 开源许可证](#-开源许可证)
@@ -154,6 +147,13 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 
 ---
 
+### 🤝 兄弟项目 (Sibling Projects)
+
+本项目是微信个人知识库与 AI 助理导出家族的三部曲之一：
+1. **[`yaping-pro/wx-tablet-mode`](https://github.com/yaping-pro/wx-tablet-mode)** (GPL-3.0) — 安卓微信平板模式登录资格赋予与外观伪装 Xposed 模块。
+2. **[`yaping-pro/wx-pad-exporter`](https://github.com/yaping-pro/wx-pad-exporter)** (MIT) — 手机/平板端微信实时聊天流只读导出守护进程 + Webhook 桥接（数据出口格式与本项目 100% 保持一致）。
+3. **`yaping-pro/wx-linux-exporter`** (MIT, 本仓库) — **Linux / Homelab 原生微信定时解密、WAL 二进制合并、原子版本发布与只读快照导出服务（基准参考实现）**。
+
 ### 💬 交流群 / Community
 
 欢迎加入微信个人助理与数据管道交流群（探讨 Homelab 微信常驻、AI 助理搭建、数据管道等）：
@@ -183,7 +183,7 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 
 ## English
 
-### Sibling Projects
+### 🤝 Sibling Projects
 - **[`yaping-pro/wx-tablet-mode`](https://github.com/yaping-pro/wx-tablet-mode)** (GPL-3.0) — WeChat Android Tablet-mode login & disguise hook.
 - **[`yaping-pro/wx-pad-exporter`](https://github.com/yaping-pro/wx-pad-exporter)** (MIT) — Real-time read-only chatstream exporter daemon for phone/tablet WeChat.
 - **`yaping-pro/wx-linux-exporter`** (MIT, this repo) — **Homelab Linux PC-WeChat decrypt -> publish -> serve reference pipeline.**
