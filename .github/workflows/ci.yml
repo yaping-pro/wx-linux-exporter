@@ -1,0 +1,68 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pycryptodome zstandard jsonschema flake8
+
+      - name: Compile python sources
+        run: |
+          python -m py_compile bin/*.py clients/*.py
+
+      - name: Lint with flake8 (syntax errors)
+        run: |
+          flake8 bin/ clients/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Validate JSON schemas
+        run: |
+          python -c "import json; json.load(open('schema/export.schema.json')); json.load(open('config/export_service.json'))"
+
+      - name: Check shell scripts syntax
+        run: |
+          bash -n bin/*.sh scripts/*.sh
+
+  release:
+    needs: lint-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package Release Bundle
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          ARCHIVE_NAME="wx-linux-exporter-${TAG_NAME}.tar.gz"
+          tar --exclude='.git' --exclude='.github' -czf "${ARCHIVE_NAME}" *
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true

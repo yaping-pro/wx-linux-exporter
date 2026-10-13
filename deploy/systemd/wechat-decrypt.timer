@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic WeChat Database Decryption
+After=network.target
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

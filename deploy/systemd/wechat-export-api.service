@@ -1,0 +1,16 @@
+[Unit]
+Description=WeChat Vault Muse Export API
+After=network.target
+
+[Service]
+Type=simple
+User=%I
+Group=%I
+WorkingDirectory=%h/.local/share/wechat-vault
+ExecStart=/usr/bin/python3 %h/.local/share/wechat-vault/bin/wechat_export_api.py --config %h/.local/share/wechat-vault/config/export_service.json
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
