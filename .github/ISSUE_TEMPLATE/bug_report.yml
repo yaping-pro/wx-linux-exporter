@@ -1,0 +1,72 @@
+name: 🐛 Bug Report / 故障反馈
+description: 提交数据导出管道异常、解密/解压失败、消费端异常等问题 / Report an issue in the Linux pipeline
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢提交反馈！提交前请确认已阅读 [CONTRIBUTING.md](https://github.com/yaping-pro/wx-linux-exporter/blob/main/CONTRIBUTING.md) 的边界说明：
+        **注意：安卓设备端 Hook 探针与守护进程源码位于上游独立仓库，本仓库仅负责 Linux 侧消费管道与运维编排。**
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述 / What happened
+      description: 清晰扼要地描述遇到的故障 / Clear and concise description of the bug
+      placeholder: 例如：运行 bin/export_service.py 时，遇到特定 zstandard 压缩流解包报错...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 / Expected behavior
+      description: 正常情况下应该发生什么 / What should happen under normal conditions
+      placeholder: 例如：正确解压消息正文并更新状态游标文件。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: 触发该问题的具体操作顺序 / Detailed steps to reproduce the behavior
+      value: |
+        1. 启动 Linux 消费服务: `python bin/export_service.py`
+        2. 触发或拉取消息流
+        3. 观察报错与输出：...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境 / Environment
+      description: 请详细提供 Linux 发行版与 Python 环境信息 / Detailed system environment
+      value: |
+        - Linux 发行版 (OS / Distro): e.g. Ubuntu 24.04 LTS / Debian 12 / Arch Linux
+        - 架构 (Arch): x86_64 / arm64
+        - Python 版本 (Python Version): e.g. Python 3.11.8
+        - 套件版本 (Suite Version): e.g. v1.0.1 (Commit xxx)
+        - 依赖版本 (Dependencies): pycryptodome / zstandard / jsonschema
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 脱敏日志 / Sanitized Logs
+      description: |
+        请提供管道执行日志或错误调用栈。
+        ⚠️ 严禁粘贴真实聊天消息文本、私网 IP、密钥或解密 Key！
+      placeholder: 粘贴脱敏后的代码块...
+    validations:
+      required: false
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: 免责与合规确认 / Compliance & Disclaimer Confirmation
+      description: 提交前请仔细确认下列条款 / Please confirm before submitting
+      options:
+        - label: 我已知晓本仓库聚焦于 Linux 侧数据流消费管道与运维，非安卓设备端探针仓库。
+          required: true
+        - label: 测试发生在我个人拥有并合法持有的环境与数据上，用于个人数据主权与归档目的。
+          required: true
+        - label: 我已仔细检查提交的日志与配置，确认已彻底脱敏，不含真实凭据或个人聊天隐私。
+          required: true

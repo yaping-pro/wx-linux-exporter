@@ -1,0 +1,46 @@
+name: 💡 Feature Request / 功能建议
+description: 为 Linux 导出管道与运维编排建议新特性 / Suggest an idea or pipeline enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出改进建议！请注意本仓库定位为 **Linux 侧管道消费、解析、格式标准化与运维工具**。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 背景与痛点 / Problem statement
+      description: 当前遇到了什么不便，或者希望支持什么新的下游消费场景？ / What problem are you trying to solve?
+      placeholder: 例如：希望新增对特定自建向量库或归档格式的输出插件...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望方案 / Proposed solution
+      description: 建议如何实现 / Describe the solution you'd like
+      placeholder: 详细描述建议的数据格式、接口设计或脚本改进...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案 / Alternatives considered
+      description: 是否考虑过其他替代实现？ / Describe any alternatives you've considered
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 涉及范围 / Scope
+      description: 该功能属于哪一部分 / Which component does this proposal touch?
+      options:
+        - "消费管道与导出核心 (bin/ / export_service)"
+        - "客户端桥接 (clients/)"
+        - "运维与守护脚本 (ops/ / scripts/)"
+        - "数据契约 (schema/)"
+        - "文档 (docs/)"
+        - "其他 (Other)"
+    validations:
+      required: true
