@@ -83,11 +83,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download release artifacts
-        uses: robinraju/release-downloader@v1
-        with:
-          tag: ${{ github.ref_name }}
-          fileName: 'wx-linux-exporter-${{ github.ref_name }}.tar.gz'
-          fileName1: 'wx-linux-exporter-${{ github.ref_name }}.tar.gz.sha256'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'wx-linux-exporter-${{ github.ref_name }}.tar.gz*' \
+            --dir .
 
       - name: Unpack and verify tarball
         run: |
