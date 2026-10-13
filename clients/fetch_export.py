@@ -104,7 +104,7 @@ def _get(url, token=None, timeout=FETCH_TIMEOUT):
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}) if _bypass_proxy(url) else urllib.request.ProxyHandler()
     )
-    req = urllib.request.Request(url, headers={"User-Agent": "wechat-pad-exporter-consumer/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "wx-linux-exporter-consumer/1.0"})
     if token:
         req.add_header("Authorization", "Bearer " + token)
     return opener.open(req, timeout=timeout)

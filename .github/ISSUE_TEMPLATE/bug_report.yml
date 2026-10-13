@@ -13,7 +13,7 @@ body:
     attributes:
       label: 问题描述 / What happened
       description: 清晰扼要地描述遇到的故障 / Clear and concise description of the bug
-      placeholder: 例如：运行 bin/export_service.py 时，遇到特定 zstandard 压缩流解包报错...
+      placeholder: 例如：运行 bin/wechat_export_api.py 时，遇到特定 zstandard 压缩流解包报错...
     validations:
       required: true
   - type: textarea
@@ -30,7 +30,7 @@ body:
       label: 复现步骤 / Steps to reproduce
       description: 触发该问题的具体操作顺序 / Detailed steps to reproduce the behavior
       value: |
-        1. 启动 Linux 消费服务: `python bin/export_service.py`
+        1. 启动 Linux 消费服务: `python bin/wechat_export_api.py`
         2. 触发或拉取消息流
         3. 观察报错与输出：...
     validations:

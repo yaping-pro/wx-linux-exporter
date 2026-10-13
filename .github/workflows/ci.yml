@@ -19,10 +19,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (hash-pinned)
         run: |
           python -m pip install --upgrade pip
-          pip install pycryptodome zstandard jsonschema flake8
+          pip install --require-hashes -r requirements.txt -r requirements-dev.txt
 
       - name: Compile python sources
         run: |
@@ -40,20 +40,28 @@ jobs:
         run: |
           bash -n bin/*.sh scripts/*.sh
 
+      - name: Assistant webhook field-mapping regression test
+        run: |
+          python3 clients/test_assistant_webhook.py
+
   release:
     needs: lint-and-test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Package Release Bundle
+      - name: Package Release Bundle (top-level prefix dir)
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
           ARCHIVE_NAME="wx-linux-exporter-${TAG_NAME}.tar.gz"
-          tar --exclude='.git' --exclude='.github' -czf "${ARCHIVE_NAME}" *
+          PREFIX="wx-linux-exporter-${TAG_NAME}"
+          # Build an archive with a single top-level directory so users do not
+          # get a tarbomb. Exclude VCS, CI metadata, and Python bytecode caches
+          # (not shipped).
+          STAGE=$(mktemp -d)
+          mkdir -p "${STAGE}/${PREFIX}"
+          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' \
+              --exclude='*.pyc' -cf - * | tar -xf - -C "${STAGE}/${PREFIX}"
+          (cd "$STAGE" && tar -czf "${GITHUB_WORKSPACE:+$GITHUB_WORKSPACE/}${ARCHIVE_NAME}" "$PREFIX")
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
           sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
 
@@ -66,3 +74,54 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+  # Release Truth Gate (R-005): do not trust that the build "exited 0" — actually
+  # unpack the shipped tarball in a clean temp dir and prove it works end-to-end.
+  verify-release-tarball:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: robinraju/release-downloader@v1
+        with:
+          tag: ${{ github.ref_name }}
+          fileName: 'wx-linux-exporter-${{ github.ref_name }}.tar.gz'
+          fileName1: 'wx-linux-exporter-${{ github.ref_name }}.tar.gz.sha256'
+
+      - name: Unpack and verify tarball
+        run: |
+          set -euo pipefail
+          ARCHIVE="wx-linux-exporter-${{ github.ref_name }}.tar.gz"
+          SHA_FILE="${ARCHIVE}.sha256"
+          WORK=$(mktemp -d)
+          echo "== Working dir: $WORK"
+
+          echo "== 1. SHA-256 sidecar matches the tarball =="
+          sha256sum -c "$SHA_FILE"
+
+          echo "== 2. tar tzf sanity (top-level prefix dir + expected entries) =="
+          tar tzf "$ARCHIVE" > /tmp/manifest.txt
+          head -n 20 /tmp/manifest.txt
+          PREFIX="wx-linux-exporter-${{ github.ref_name }}/"
+          grep -q "^${PREFIX}CHANGELOG.md" /tmp/manifest.txt || { echo "FAIL: CHANGELOG.md missing from tarball"; exit 1; }
+          grep -q "^${PREFIX}scripts/selfcheck.sh" /tmp/manifest.txt || { echo "FAIL: scripts/selfcheck.sh missing"; exit 1; }
+
+          echo "== 3. Extract into clean temp dir =="
+          tar -xzf "$ARCHIVE" -C "$WORK"
+
+          echo "== 4. py_compile every extracted .py =="
+          mapfile -t PYS < <(find "$WORK" -name '*.py')
+          if [ "${#PYS[@]}" -eq 0 ]; then echo "FAIL: no python files in tarball"; exit 1; fi
+          python3 -m py_compile "${PYS[@]}"
+
+          echo "== 5. self-contained smoke check =="
+          if [ -f "$WORK/${PREFIX}scripts/selfcheck.sh" ]; then
+            chmod +x "$WORK/${PREFIX}scripts/selfcheck.sh"
+            bash "$WORK/${PREFIX}scripts/selfcheck.sh" || { echo "FAIL: selfcheck.sh returned non-zero"; exit 1; }
+          else
+            echo "FAIL: selfcheck.sh not present after extraction"; exit 1
+          fi
+
+          echo "== Release tarball verified OK =="
+          rm -rf "$WORK"

@@ -4,8 +4,8 @@ After=wechat-runner.service
 
 [Service]
 Type=oneshot
-User=%I
-ExecStart=%h/.local/share/wechat-vault/bin/wechat-sync.sh
+User=__WXUSER__
+ExecStart=__WXHOME__/.local/share/wechat-vault/bin/wechat-sync.sh
 
 [Install]
 WantedBy=multi-user.target

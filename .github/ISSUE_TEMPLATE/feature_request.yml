@@ -36,9 +36,9 @@ body:
       label: 涉及范围 / Scope
       description: 该功能属于哪一部分 / Which component does this proposal touch?
       options:
-        - "消费管道与导出核心 (bin/ / export_service)"
+        - "消费管道与导出核心 (bin/ / wechat_export_api)"
         - "客户端桥接 (clients/)"
-        - "运维与守护脚本 (ops/ / scripts/)"
+        - "运维与守护脚本 (deploy/ / scripts/)"
         - "数据契约 (schema/)"
         - "文档 (docs/)"
         - "其他 (Other)"

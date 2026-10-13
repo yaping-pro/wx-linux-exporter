@@ -40,6 +40,7 @@
 # 1. 下载并解压最新发布包
 TAG=$(curl -s https://api.github.com/repos/yaping-pro/wx-linux-exporter/releases/latest | grep -Po '"tag_name": "\K.*?(?=")')
 wget "https://github.com/yaping-pro/wx-linux-exporter/releases/download/${TAG}/wx-linux-exporter-${TAG}.tar.gz"
+mkdir -p ~/.local/share/wechat-vault
 tar -xzf "wx-linux-exporter-${TAG}.tar.gz" -C ~/.local/share/wechat-vault/
 
 # 2. 生成安全 Token 并初始化配置
@@ -119,9 +120,12 @@ bash scripts/selfcheck.sh
 
 ```bash
 USER=$(whoami)
+HOME_DIR="$HOME"
 sudo cp deploy/systemd/wechat-*.service /etc/systemd/system/
 sudo cp deploy/systemd/wechat-*.timer /etc/systemd/system/
-sudo sed -i "s/%I/$USER/g" /etc/systemd/system/wechat-*.service
+# Render the install-time placeholders (__WXUSER__ -> login user, __WXHOME__ -> real home).
+# These units are SYSTEM scope, so they previously broke by expanding %h to /root.
+sudo sed -i "s|__WXUSER__|$USER|g; s|__WXHOME__|$HOME_DIR|g" /etc/systemd/system/wechat-*.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wechat-export-api

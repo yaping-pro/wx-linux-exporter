@@ -10,9 +10,9 @@ Closes #
 
 ## 变更范围 / Scope of Change
 
-- [ ] `bin/`: 消费服务与导出核心 (`export_service.py` 等)
+- [ ] `bin/`: 消费服务与导出核心 (`wechat_export_api.py` 等)
 - [ ] `clients/`: 客户端适配与下游消费桥接
-- [ ] `ops/` / `scripts/`: Linux 部署守护与运维脚本
+- [ ] `deploy/` / `scripts/`: Linux 部署守护与运维脚本
 - [ ] `schema/`: JSON 数据规范
 - [ ] `docs/`: 文档与架构说明
 

@@ -1,6 +1,6 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.0.1` (2026-10-13)
+> **版本**：`v1.0.2` (2026-10-13)
 > **适用范围**：`wx-pad-exporter` (安卓 Pad 守护进程) 及 Linux 家服 (`wechat-export-api`)  
 > **Schema 定义**：[`schema/export.schema.json`](../schema/export.schema.json)
 
@@ -31,7 +31,7 @@
 | :--- | :--- | :--- |
 | **默认监听地址** | `127.0.0.1:8765` (本地回环) | `<TAILNET_IP>:8765` (Tailscale 私网裸 IP) |
 | **推荐访问通道** | `adb forward tcp:8765 tcp:8765`<br/>或 Tailscale 私网隧道 | Tailscale 点对点加密通道 (`100.64.0.0/10`) |
-| **鉴权机制** | `Authorization: Bearer <TOKEN>`<br/>*(缺省为空放行，可通过 `-token` 启用)* | **强制必须** `Authorization: Bearer <TOKEN>`<br/>*(仅 `/health` 存活探针免鉴权；默认失败关闭，无 token 拒绝启动)* |
+| **鉴权机制** | **强制必须** `Authorization: Bearer <TOKEN>`<br/>*(仅 `/health` 存活探针免鉴权；默认失败关闭，无 token 拒绝启动)* | **强制必须** `Authorization: Bearer <TOKEN>`<br/>*(仅 `/health` 存活探针免鉴权；默认失败关闭，无 token 拒绝启动)* |
 | **时区规范** | `Asia/Shanghai (+08:00)` | `Asia/Shanghai (+08:00)` |
 | **公网策略** | **严禁公网暴露**，零端口映射 | **严禁公网暴露**，零端口映射 |
 
@@ -279,5 +279,5 @@ Algorithm IncrementalWeChatSync:
 | **历史数据厚度** | 拥有**全量历史与群聊归档**（支持数月甚至数年前的冷数据回溯） | 仅能捕获**该设备安装并启动 Hook 以来实时接收到的新消息**，无历史冷库回溯能力 |
 | **发送者标识 (sender)** | 经过联系人反查解析后的**展示名称**（群聊为昵称，私聊为对方备注，本机为 `"我"`） | 原始微信 ID（如 `wxid_xxx` 或 `self` / `"我"`） |
 | **会话层结构** | 仅含核心 3 字段：`name`, `kind`, `messages` | **超集**：除上述 3 字段外，扩展提供 `chat_id`, `display_name`, `is_group` |
-| **鉴权默认值** | **强制 Bearer Token** 鉴权 | **默认免密**（`-token` 缺省为空）；启动加 `-token <TOKEN>` 时开启强制 Bearer 鉴权 |
+| **鉴权默认值** | **强制 Bearer Token** 鉴权 | **强制 Bearer Token** 鉴权（默认失败关闭：无 token 且未显式 `--insecure-no-auth` 时服务拒绝启动） |
 | **两端数据交集** | 实测两端消息重叠度为 0%（各自独立捕获所属设备接收的消息流），为**互补拓扑**而非互为主备 | 同左 |

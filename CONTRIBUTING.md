@@ -6,18 +6,15 @@ Thanks for your interest. This repo is the **pipeline / consumer / ops** side of
 
 The **device-side source is NOT in this repository.**
 
-> Per `device/README.md`:
-> "设备端**源码**不在本仓库。" / "**设备端源码在 A 仓库** `wx-pad-sniffer`（有 remote + CNB CI + APK 产物）"
-
-And `docs/upstream/README.md`:
-
-> "本目录存放从设备端源码仓库 **A = `wx-pad-sniffer`** 复制的文档"
+The WeChat pad/tablet Xposed module, the `wx_daemon` Go source, and the phone
+`deploy/` scripts live in the sibling repo **[`yaping-pro/wx-pad-exporter`](https://github.com/yaping-pro/wx-pad-exporter)**
+(alongside **[`yaping-pro/wx-tablet-mode`](https://github.com/yaping-pro/wx-tablet-mode)** for the Android module itself).
 
 So:
 
-- **Do not** open pull requests that add or modify the WeChat Xposed module, the `wx_daemon` Go source, or the `deploy/` scripts that belong to device builds. Those live in the separate repo **`wx-pad-sniffer`** and must be changed there.
-- This repo is for: the consumer script (`consumer/`), ops/deploy scripts (`ops/`), the sing-box config, self-check tooling (`scripts/`), and documentation about the pipeline.
-- If you fix something that originates in the device source, open the change against `wx-pad-sniffer` and, if needed, mirror the resulting docs into `docs/upstream/` here (keeping their md5 + timestamp, as that directory documents).
+- **Do not** open pull requests here that add or modify the WeChat Xposed module, the `wx_daemon` Go source, or the phone `deploy/` scripts. Those belong to **`yaping-pro/wx-pad-exporter`** and must be changed there first.
+- This repo (**`yaping-pro/wx-linux-exporter`**) is for: the consumer clients (`clients/`), the homelab decrypt/serve pipeline (`bin/`), ops/deploy units (`deploy/`), the sing-box config, self-check tooling (`scripts/`), and documentation about the pipeline.
+- If you fix something that originates in the device source, open the change against **`yaping-pro/wx-pad-exporter`** and, if needed, mirror the resulting documentation into `docs/` here.
 
 ## Commit message style
 

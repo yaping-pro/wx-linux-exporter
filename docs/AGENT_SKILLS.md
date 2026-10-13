@@ -1,6 +1,6 @@
 # 智能体技能扩展契约规范 (Agent Skills Extension Contract)
 
-> **版本**：`v1.0.1` (2026-10-13)
+> **版本**：`v1.0.2` (2026-10-13)
 > **状态**：**预留扩展插槽 (Planned Extension Hook)**  
 > **数据 Schema**：[`schema/export.schema.json`](../schema/export.schema.json)
 

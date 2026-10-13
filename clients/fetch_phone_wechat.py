@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wx-pad-sniffer Consumer Client
+wx-linux-exporter Consumer Client
 Fetch WeChat chat exports from phone endpoint (or Homelab export API) over Tailscale.
 
 Compatible with both:
@@ -112,7 +112,7 @@ def fetch_endpoint(
 ) -> tuple[int, dict[str, Any]]:
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
-    req.add_header("User-Agent", "wx-pad-consumer/1.0")
+    req.add_header("User-Agent", "wx-linux-exporter-consumer/1.0")
 
     if token:
         req.add_header("Authorization", f"Bearer {token}")

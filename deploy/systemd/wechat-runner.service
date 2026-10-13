@@ -5,7 +5,7 @@ Wants=wechat-xvfb.service
 
 [Service]
 Type=simple
-User=%I
+User=__WXUSER__
 Environment=DISPLAY=:99
 Environment=XDG_CURRENT_DESKTOP=GNOME
 Environment=QT_QPA_PLATFORM=xcb

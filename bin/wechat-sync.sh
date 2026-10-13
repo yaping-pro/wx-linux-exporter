@@ -5,7 +5,20 @@ VAULT_ROOT="${VAULT_ROOT:-$HOME/.local/share/wechat-vault}"
 DEC_DIR="$VAULT_ROOT/decrypted/current"
 KEYS_DIR="$VAULT_ROOT/keys"
 KEYS_FILE="$KEYS_DIR/all_keys.json"
-KEY_TOOL="${KEY_TOOL:-/opt/wcdb-key-tool/wcdb_key_tool.py}"
+KEY_TOOL="${KEY_TOOL:-$VAULT_ROOT/bin/extract_keys.py}"
+
+# Resolve the key tool at runtime: prefer the repo-shipped extractor, fall back to
+# the legacy external path if a custom KEY_TOOL was not explicitly provided.
+if [[ -z "${KEY_TOOL_ORIG:-}" ]]; then
+    KEY_TOOL_ORIG="$KEY_TOOL"
+fi
+if [[ ! -f "$KEY_TOOL" ]]; then
+    if [[ -f "$VAULT_ROOT/bin/extract_keys.py" ]]; then
+        KEY_TOOL="$VAULT_ROOT/bin/extract_keys.py"
+    elif [[ -f "/opt/wcdb-key-tool/wcdb_key_tool.py" ]]; then
+        KEY_TOOL="/opt/wcdb-key-tool/wcdb_key_tool.py"
+    fi
+fi
 PASSPHRASE_FILE="${PASSPHRASE_FILE:-$HOME/.wcdb-key-tool/wechat-passphrase.json}"
 LOG_FILE="$VAULT_ROOT/sync.log"
 RETENTION_VERSIONS="${RETENTION_VERSIONS:-${1:-3}}"

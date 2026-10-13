@@ -86,10 +86,12 @@ chmod +x "$VAULT_ROOT/bin/"*
 以普通用户权限运行（或通过系统 systemd 并注入 User 用户名）：
 ```bash
 USER_NAME=$(whoami)
-# 安装服务模板，将 %I 替换为当前用户
+HOME_DIR="$HOME"
+# 安装服务单元，渲染安装期占位符 (__WXUSER__ -> 当前用户, __WXHOME__ -> 真实家目录)。
+# 这些单元是 SYSTEM 作用域，旧版 %h 会展开为 /root 导致启动失败。
 sudo cp deploy/systemd/wechat-*.service /etc/systemd/system/
 sudo cp deploy/systemd/wechat-*.timer /etc/systemd/system/
-sudo sed -i "s/%I/$USER_NAME/g" /etc/systemd/system/wechat-*.service
+sudo sed -i "s|__WXUSER__|$USER_NAME|g; s|__WXHOME__|$HOME_DIR|g" /etc/systemd/system/wechat-*.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now wechat-xvfb.service
