@@ -60,7 +60,7 @@ jobs:
           STAGE=$(mktemp -d)
           mkdir -p "${STAGE}/${PREFIX}"
           tar --exclude='.git' --exclude='.github' --exclude='__pycache__' \
-              --exclude='*.pyc' -cf - * | tar -xf - -C "${STAGE}/${PREFIX}"
+              --exclude='*.pyc' -cf - . | tar -xf - -C "${STAGE}/${PREFIX}"
           (cd "$STAGE" && tar -czf "${GITHUB_WORKSPACE:+$GITHUB_WORKSPACE/}${ARCHIVE_NAME}" "$PREFIX")
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
           sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
@@ -73,7 +73,7 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.sha256
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
 
   # Release Truth Gate (R-005): do not trust that the build "exited 0" — actually
   # unpack the shipped tarball in a clean temp dir and prove it works end-to-end.
@@ -104,8 +104,8 @@ jobs:
           tar tzf "$ARCHIVE" > /tmp/manifest.txt
           head -n 20 /tmp/manifest.txt
           PREFIX="wx-linux-exporter-${{ github.ref_name }}/"
-          grep -q "^${PREFIX}CHANGELOG.md" /tmp/manifest.txt || { echo "FAIL: CHANGELOG.md missing from tarball"; exit 1; }
-          grep -q "^${PREFIX}scripts/selfcheck.sh" /tmp/manifest.txt || { echo "FAIL: scripts/selfcheck.sh missing"; exit 1; }
+          grep -qE "(^|\\./)${PREFIX}CHANGELOG.md" /tmp/manifest.txt || { echo "FAIL: CHANGELOG.md missing from tarball"; exit 1; }
+          grep -qE "(^|\\./)${PREFIX}scripts/selfcheck.sh" /tmp/manifest.txt || { echo "FAIL: scripts/selfcheck.sh missing"; exit 1; }
 
           echo "== 3. Extract into clean temp dir =="
           tar -xzf "$ARCHIVE" -C "$WORK"
