@@ -409,11 +409,18 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def check_auth(self) -> bool:
-        """Validates Bearer token in Authorization header."""
+        """Validates Bearer token in Authorization header when auth is enabled.
+
+        Auth is disabled only when the operator explicitly starts with
+        ``--insecure-no-auth`` (and no token). In that case any request passes,
+        which is intentionally fail-open but gated behind an explicit opt-in flag.
+        """
+        if not self.server_context.get("auth_enabled", True):
+            return True
         expected_token = self.server_context.get("token")
         if not expected_token:
-            return True
-
+            # Defensive: auth_enabled without a token must never silently pass.
+            return False
         auth_header = self.headers.get("Authorization", "")
         parts = auth_header.strip().split()
         if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == expected_token:
@@ -427,6 +434,10 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if path in ("/health", "/api/wechat/health"):
+            # Intentionally UNAUTHENTICATED liveness probe (F-003): it exposes no chat
+            # data, only service status. `/api/wechat/export` always requires a Bearer
+            # token. This two-tier policy is documented in docs/API_SPEC.md,
+            # docs/DATA_CONTRACT.md, and AGENT.md.
             self.send_json(200, {"status": "ok"})
             return
 
@@ -471,6 +482,7 @@ def create_server(
     port: int,
     vault_dir: Path | str,
     token: str | None = None,
+    auth_enabled: bool = True,
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
 ) -> HTTPServer:
@@ -478,10 +490,9 @@ def create_server(
     server_context = {
         "vault_dir": str(vault_dir),
         "token": token,
+        "auth_enabled": auth_enabled,
         "allowlist": allowlist or [],
-        "blocklist": blocklist or [],
     }
-
     try:
         from http.server import ThreadingHTTPServer
         server_class = ThreadingHTTPServer
@@ -492,7 +503,6 @@ def create_server(
         return WeChatExportHandler(*args, server_context=server_context, **kwargs)
 
     return server_class((host, port), handler_factory)
-
 
 def load_config_file(config_path: Path) -> dict[str, Any]:
     """Loads JSON configuration file."""
@@ -511,7 +521,19 @@ def main() -> None:
     parser.add_argument("--host", type=str, help="Host/IP to bind to (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, help="Port to bind to (default: 8765)")
     parser.add_argument("--vault-dir", type=str, help="Path to decrypted WeChat vault directory")
-    parser.add_argument("--token", type=str, help="Bearer token for API authorization")
+    parser.add_argument(
+        "--token",
+        type=str,
+        help="Bearer token for API authorization. REQUIRED (fail-closed): the service refuses "
+             "to start without this (or a 'token' in config) unless --insecure-no-auth is given.",
+    )
+    parser.add_argument(
+        "--insecure-no-auth",
+        action="store_true",
+        help="Run the API WITHOUT authentication. Dangerous: any client that can reach the "
+             "bound port can read all exported chat data. Use only on trusted loopback/dev. "
+             "Required to start when no token is configured (fail-closed default otherwise).",
+    )
 
     args = parser.parse_args()
 
@@ -541,6 +563,32 @@ def main() -> None:
     port = int(config["port"])
     vault_dir = Path(config["vault_dir"]).expanduser()
     token = config.get("token")
+    auth_enabled = bool(token) or bool(args.insecure_no_auth)
+    # When --insecure-no-auth is set with an empty token, auth is explicitly disabled.
+    if args.insecure_no_auth and not token:
+        auth_enabled = False
+    # Fail-closed auth policy: refuse to start without a token unless the operator
+    # explicitly opts out with --insecure-no-auth. A token-less server would otherwise
+    # accept unauthenticated requests and expose all exported chat data.
+    if not token and not args.insecure_no_auth:
+        print(
+            "[FATAL] No auth token configured (--token / config 'token'). "
+            "Refusing to start with fail-open auth.",
+            file=sys.stderr,
+        )
+        print(
+            "[FATAL] Set a high-entropy token (e.g. `openssl rand -hex 32`) in config or "
+            "`--token`, or pass `--insecure-no-auth` to run unauthenticated on trusted loopback only.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.insecure_no_auth and not token:
+        print(
+            "[WARN] Authentication DISABLED via --insecure-no-auth. The export endpoint is "
+            "open to anyone who can reach the bound port. Bind 127.0.0.1 only.",
+            file=sys.stderr,
+        )
     allowlist = config.get("allowlist", [])
     blocklist = config.get("blocklist", [])
 
@@ -557,6 +605,7 @@ def main() -> None:
         port=port,
         vault_dir=vault_dir,
         token=token,
+        auth_enabled=auth_enabled,
         allowlist=allowlist,
         blocklist=blocklist,
     )

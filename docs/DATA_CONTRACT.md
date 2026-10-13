@@ -1,6 +1,6 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.0.0` (2026-10-13)  
+> **版本**：`v1.0.1` (2026-10-13)
 > **适用范围**：`wx-pad-exporter` (安卓 Pad 守护进程) 及 Linux 家服 (`wechat-export-api`)  
 > **Schema 定义**：[`schema/export.schema.json`](../schema/export.schema.json)
 
@@ -31,7 +31,7 @@
 | :--- | :--- | :--- |
 | **默认监听地址** | `127.0.0.1:8765` (本地回环) | `<TAILNET_IP>:8765` (Tailscale 私网裸 IP) |
 | **推荐访问通道** | `adb forward tcp:8765 tcp:8765`<br/>或 Tailscale 私网隧道 | Tailscale 点对点加密通道 (`100.64.0.0/10`) |
-| **鉴权机制** | `Authorization: Bearer <TOKEN>`<br/>*(缺省为空放行，可通过 `-token` 启用)* | **强制必须** `Authorization: Bearer <TOKEN>` |
+| **鉴权机制** | `Authorization: Bearer <TOKEN>`<br/>*(缺省为空放行，可通过 `-token` 启用)* | **强制必须** `Authorization: Bearer <TOKEN>`<br/>*(仅 `/health` 存活探针免鉴权；默认失败关闭，无 token 拒绝启动)* |
 | **时区规范** | `Asia/Shanghai (+08:00)` | `Asia/Shanghai (+08:00)` |
 | **公网策略** | **严禁公网暴露**，零端口映射 | **严禁公网暴露**，零端口映射 |
 
@@ -39,21 +39,13 @@
 
 #### (1) `GET /health` (或 `GET /api/wechat/health`)
 - **功能**：服务存活、运行指标与采集连接健康探针。
+- **鉴权（重要）**：**此端点无需鉴权（UNAUTHENTICATED）**。它是显式设计的存活探针，仅返回服务状态，**不泄露任何聊天数据**。它刻意绕过 Bearer Token 校验——负载均衡器、K8s 探针与本地自检可在不持有密钥的情况下探测服务存活。
+  > ⚠️ 注意：只有 `/health` 与 `/api/wechat/health` 免鉴权。所有承载聊天数据的端点（特别是 `/api/wechat/export`）**始终要求** `Authorization: Bearer <TOKEN>`，无 token 一律返回 `401`。`wx-linux-exporter` 的鉴权**默认失败关闭（fail-closed）**：若配置中未设置 token 且未显式传入 `--insecure-no-auth`，服务将拒绝启动。
 - **状态码**：`200 OK`
-- **响应体示例**：
+- **家服端响应体示例**（`wechat-export-api` 仅返回最小状态对象）：
 ```json
-{
-  "status": "ok",
-  "uptime_seconds": 167204,
-  "uds_connected": true,
-  "active_uds_connections": 1,
-  "total_messages": 1718,
-  "total_received_stream": 477,
-  "memory_bytes": 641264,
-  "version": "1.0.0-pad"
-}
+{ "status": "ok" }
 ```
-
 #### (2) `GET /api/wechat/export`
 - **功能**：增量/全量拉取结构化消息快照。
 - **请求参数**：

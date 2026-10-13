@@ -117,8 +117,8 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/api/wechat/expor
 - 🔴 **严禁将服务端口 8765 监听在 `0.0.0.0`**（默认仅绑定 `127.0.0.1`；跨机调用只走 Tailscale / WireGuard 私网或 SSH 隧道）。
 - 🔴 **严禁将任何解密数据库（`*.db`、`*.db-wal`）提交至 Git 或暴露在外网**。
 - 🔴 **解密目录权限必须硬锁为 0700 / 0600**，确保多租户隔离。
-- 🔴 **禁止在微信主进程执行数据库事务写操作**，整个流水线基于副本解密与 WAL 内存合并，严禁修改原库。
-
+- 🔴 **鉴权默认失败关闭（Fail-Closed）**：`wechat_export_api.py` **必须**配置 Bearer Token（config 的 `token` 字段或 `--token`）。未配置 token 且未显式传入 `--insecure-no-auth` 时，服务**拒绝启动**（退出码 2）。Token 缺失绝不会退化为“免密放行”。
+- 🟡 **`/health` 存活探针免鉴权（显式设计）**：`GET /health` 与 `GET /api/wechat/health` **无需 Token** 即返回 `200`，因为它们仅暴露服务存活状态、不泄露任何聊天数据。所有承载聊天数据的端点（特别是 `/api/wechat/export`）**始终要求** `Authorization: Bearer <TOKEN>`，无 Token 一律 `401`。请勿在自检或告警探针中依赖导出端点的免鉴权行为。
 ---
 
 ### 4. 回滚与卸载 (Rollback & Uninstall)
@@ -155,4 +155,5 @@ Before mutating the system, the agent MUST verify all prerequisites. If any chec
 ### 2. Safety Rails
 - NEVER bind `8765` to `0.0.0.0`. Default to `127.0.0.1` or Tailscale overlay IP.
 - Enforce strict `0700` directory and `0600` file permissions on `$HOME/.local/share/wechat-vault`.
-- Decryption is completely read-only on cloned database files. Never touch live WeChat process files in write mode.
+- **Auth is FAIL-CLOSED by default**: `wechat_export_api.py` REQUIRES a Bearer token (config `token` field or `--token`). With no token configured and without the explicit `--insecure-no-auth` flag, the service REFUSES to start (exit code 2). A missing token never degrades to open access.
+- **`/health` is intentionally UNAUTHENTICATED**: `GET /health` / `GET /api/wechat/health` return `200` with NO token because they expose only liveness status, never chat data. Every data-bearing endpoint (especially `/api/wechat/export`) ALWAYS requires `Authorization: Bearer <TOKEN>` and returns `401` otherwise. Do not rely on the export endpoint being open in health checks or alerting probes.

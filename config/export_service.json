@@ -1,4 +1,5 @@
 {
+  "_note": "The 'token' field is REQUIRED. A missing/empty token makes the service refuse to start (fail-closed). Set it to a high-entropy value, e.g. `openssl rand -hex 32`. To run without auth (dev/trusted loopback only), pass `--insecure-no-auth` on the command line.",
   "host": "127.0.0.1",
   "port": 8765,
   "token": "REPLACE_WITH_YOUR_AUTH_TOKEN",

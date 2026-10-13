@@ -1,6 +1,6 @@
 # 微信数据导出集成指南 (Integrations & Downstream Recipes)
 
-> **版本**：`v1.0.0` (2026-10-13)  
+> **版本**：`v1.0.1` (2026-10-13)
 > **基础契约**：参见 [`docs/DATA_CONTRACT.md`](./DATA_CONTRACT.md)  
 > **Schema 校验**：参见 [`schema/export.schema.json`](../schema/export.schema.json)
 
