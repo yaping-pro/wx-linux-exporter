@@ -119,6 +119,21 @@ bash scripts/selfcheck.sh
 - `wechat-export-api.service`：以不可变方式只读提供 HTTP 查询快照。
 
 ```bash
+# Canonical one-shot install: copies the units, substitutes __WXUSER__/__WXHOME__,
+# and enables + starts the services. Run as root (it resolves the target user).
+sudo ./deploy/install-systemd.sh
+# Or target a specific user/home:
+# sudo ./deploy/install-systemd.sh --user wechat --home /home/wechat
+```
+
+> The units ship with install-time placeholders `__WXUSER__` / `__WXHOME__`
+> (system-scope units can't use `%h`, which expands to `/root`). The script
+> above substitutes both and aborts if any placeholder or `%h`/`%I` survives,
+> so a raw `cp` of an unrendered unit can never reach systemd.
+
+<details><summary>Manual steps (equivalent to the script)</summary>
+
+```bash
 USER=$(whoami)
 HOME_DIR="$HOME"
 sudo cp deploy/systemd/wechat-*.service /etc/systemd/system/
@@ -130,6 +145,8 @@ sudo sed -i "s|__WXUSER__|$USER|g; s|__WXHOME__|$HOME_DIR|g" /etc/systemd/system
 sudo systemctl daemon-reload
 sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wechat-export-api
 ```
+
+</details>
 
 ---
 

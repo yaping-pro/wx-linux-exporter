@@ -12,7 +12,7 @@
 ---
 ## [v1.0.2] - 2026-10-13
 ### Fixed
-- **P0 文档/客户端仓库名残留**：`CONTRIBUTING.md` 与 `clients/*.py` 中对已废弃内部名 `wx-pad-sniffer` / `wechat-pad-exporter` 的引用统一指向公共仓库 `yaping-pro/wx-pad-exporter` 与 `yaping-pro/wx-tablet-mode`；客户端 User-Agent 统一为 `wx-linux-exporter-*`。
+- **P0 文档/客户端仓库名残留**：已统一将文档与客户端中对旧私有内部仓库名的引用指向公共仓库 `yaping-pro/wx-pad-exporter` 与 `yaping-pro/wx-tablet-mode`；客户端 User-Agent 统一为 `wx-linux-exporter-*`。
 - **P0 `clients/assistant_webhook.py` 字段映射错误**：`format_payload()` 原先读取 `content` / `type`，而导出契约真实字段为 `text` / `kind` / `note` / `ts` / `sender` / `id`，导致推送空消息且 `ignore_self` 失效。已对齐 `wx-pad-exporter` 已修复版本：`text→content`、`kind→type` 并保留 `note` 回退；`process_chats()` 的 `is_sender` 判定同步修正。新增 `clients/test_assistant_webhook.py` 断言 schema 合规消息产出非空 content。
 - **P0 systemd 单元 SYSTEM 作用域误用 `%h`/`%I`**：`deploy/systemd/*.service` 为非模板单元，`%h` 在系统级展开为 `/root` 致服务无法启动。改为安装期占位符 `__WXUSER__` / `__WXHOME__`，README 安装脚本同时替换两者。
 - **P1 发布 tarball 为 tarbomb**：打包改为顶层前缀目录 `wx-linux-exporter-<ver>/`；README Quickstart 解压前 `mkdir -p ~/.local/share/wechat-vault`；打包步骤纳入 `CHANGELOG.md`。

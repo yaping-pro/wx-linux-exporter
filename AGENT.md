@@ -83,7 +83,14 @@ chmod +x "$VAULT_ROOT/bin/"*
 ```
 
 #### Phase 4: 配置 Systemd 服务
-以普通用户权限运行（或通过系统 systemd 并注入 User 用户名）：
+以普通用户权限运行（或通过系统 systemd 并注入 User 用户名）。推荐使用仓库自带的一键脚本，它会复制单元、替换安装期占位符 `__WXUSER__`/`__WXHOME__`，并启用+启动服务；脚本会在占位符或 `%h`/`%I` 残留时中止，避免未渲染单元直达 systemd：
+```bash
+sudo ./deploy/install-systemd.sh
+# 或指定目标用户/家目录：
+# sudo ./deploy/install-systemd.sh --user wechat --home /home/wechat
+```
+
+手动等价步骤（脚本即执行这些）：
 ```bash
 USER_NAME=$(whoami)
 HOME_DIR="$HOME"
