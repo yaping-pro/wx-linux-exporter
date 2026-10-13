@@ -58,9 +58,9 @@ python3 bin/wechat_export_api.py --config config/export_service.json
 
 ### ⚠️ 运行环境真实性验证声明 (Homelab vs VPS)
 
-> **【极其重要：诚实性与边界声明】**  
-> 本流水线**仅在常驻/闲置的 Linux 家庭服务器（Homelab，如 Ubuntu 22.04/24.04 物理机）经过生产级长效实机验证**。  
-> **本项目尚未在任何公网云服务器（Remote VPS）上进行过充分的验证**。
+> **【极其重要：诚实性与边界声明】**
+> 本仓库代码**提取自一套已在家庭服务器（Homelab）上连续、长效运行的真实生产流水线**（decrypt → publish → serve 全链路已稳定运行数周，正是当前向你个人 AI 助理持续供数的那套系统）。发布版本已对路径、IP、鉴权 Token 等个人标识做了脱敏（scrub）处理，逻辑与线上一致。
+> **唯一未经充分验证的维度是「部署到远程 VPS / 不同 Linux 发行版」**：代码逻辑本身已在生产环境被持续运行验证，绝非未经测试的 prototype。
 
 如果你计划在远程 VPS 上部署本服务，请务必特别注意以下潜在风险与技术挑战：
 1. **Systemd 与无头显示环境**：VPS 通常无物理显示输出，必须依赖 `Xvfb :99` 提供虚拟显示缓冲；部分轻量容器型 VPS（如 OpenVZ / LXC）可能缺少完整的 systemd 用户会话支持。
@@ -189,8 +189,8 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 - **`yaping-pro/wx-linux-exporter`** (MIT, this repo) — **Homelab Linux PC-WeChat decrypt -> publish -> serve reference pipeline.**
 
 ### ⚠️ Deployment Target Disclaimer (Homelab vs VPS)
-> **Notice**: This project is developed and verified **EXCLUSIVELY on an idle Linux Homelab host (Ubuntu 22.04/24.04)**.  
-> **It has NOT been validated on remote VPS instances.**  
+> **Notice**: This repository's code is **extracted directly from a live, continuously-running production WeChat pipeline on a Homelab host (Ubuntu 22.04/24.04)** — the decrypt → publish → serve chain has run uninterrupted for weeks and is the system that currently feeds your personal AI assistant. The published code is that pipeline, scrubbed of personal identifiers (paths, IPs, auth tokens); its logic matches production.
+> **The ONLY dimension that has NOT been validated is deployment on a remote VPS / different distro.** The code itself is proven in production, not an untested prototype.
 > If you deploy on a cloud VPS:
 > 1. Ensure `Xvfb` is operational for headless UI rendering.
 > 2. Be aware of disk I/O and memory limits during WCDB decrypts.

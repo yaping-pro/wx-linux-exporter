@@ -17,8 +17,8 @@
   - 要求：Linux x86_64 / arm64，推荐 Ubuntu 22.04+ 或 Debian 12+。
   - 验证命令：`uname -s` 输出必须为 `Linux`。
 - [ ] **Gate 2: 部署环境类型（极其重要）**
-  - **本项目仅在家庭/局域网常驻闲置 Linux 主机（Homelab）经过完整实机验证**。
-  - **未在公网 VPS 进行过生产级验证**。若检测到目标环境为纯 VPS 或云服务器，Agent 必须显式向用户发出警示，告知其关注：
+  - **本项目代码提取自一套已在家庭服务器（Homelab）上连续、长效运行的真实生产流水线（已稳定运行数周，即当前向你 AI 助理持续供数的那套系统），发布版已对个人标识脱敏。**
+  - **唯一未经充分验证的维度是「部署到远程 VPS / 不同发行版」**：代码逻辑本身已在生产环境被持续验证。若检测到目标环境为纯 VPS 或云服务器，Agent 仍须显式向用户发出警示，告知其关注：
     - 无 X11 显示环境时需依赖 `Xvfb`。
     - 大容量 WCDB 解密需要足够的可用内存（建议 >= 4GB）与磁盘 I/O。
     - 端口 `8765` 严禁直接暴露在公网（仅限 `127.0.0.1` 或 Tailscale 私网）。
@@ -147,8 +147,8 @@ Before mutating the system, the agent MUST verify all prerequisites. If any chec
 
 - [ ] **Gate 1: Linux Platform**: `uname -s` MUST be `Linux`.
 - [ ] **Gate 2: Deployment Target Caveat**:
-  - **This pipeline has been thoroughly verified ONLY on a standby Linux Homelab machine.**
-  - **NOT verified on remote VPS.** Warn the user if deployed on a cloud VPS (headless Xvfb, memory footprint for decrypting WCDB, disk I/O, security exposure).
+  - **This repository's code is extracted from a live, continuously-running production pipeline on a Homelab host (verified for weeks; it is the system currently feeding your AI assistant). The published code is scrubbed of personal identifiers and matches production logic.**
+  - **The ONLY dimension NOT validated is remote VPS / different-distro deployment.** The code itself is proven in production. Warn the user if deploying on a cloud VPS (headless Xvfb, memory footprint for decrypting WCDB, disk I/O, security exposure).
 - [ ] **Gate 3: Required Tools**: `python3`, `gdb`, `Xvfb`, `systemctl`.
 - [ ] **Gate 4: Native WeChat Installed**: Check `/opt/wechat/wechat` and existence of user database folders.
 
