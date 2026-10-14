@@ -10,6 +10,8 @@
 - 基础开源协作治理规范：Issue Templates (Bug Report / Feature Request / Config)、PR Template、CODEOWNERS、Dependabot 自动依赖更新及分支保护策略。
 - **社区持久备用频道**：在 README 交流群章节与 Issue 模板 `contact_links` 中新增 Telegram 群组 `t.me/WeChatExporter`，作为微信群二维码过期后的稳定备用交流渠道。
 
+### Changed
+- **开发依赖版本与 Hash 校验协同更新**：升级开发依赖套件 `flake8` 至 `7.4.1`、`pycodestyle` 至 `2.15.0`、`pyflakes` 至 `4.0.3`，并在 `requirements-dev.txt` 中重新计算并锁定 `--hash=sha256:` 完整性校验哈希；合并所有 GitHub Actions Dependabot 依赖升级 PR。
 ---
 ## [v1.0.2] - 2026-10-13
 ### Fixed
