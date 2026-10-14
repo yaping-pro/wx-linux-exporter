@@ -8,6 +8,7 @@
 ## [Unreleased]
 ### Added
 - 基础开源协作治理规范：Issue Templates (Bug Report / Feature Request / Config)、PR Template、CODEOWNERS、Dependabot 自动依赖更新及分支保护策略。
+- **社区持久备用频道**：在 README 交流群章节与 Issue 模板 `contact_links` 中新增 Telegram 群组 `t.me/WeChatExporter`，作为微信群二维码过期后的稳定备用交流渠道。
 
 ---
 ## [v1.0.2] - 2026-10-13

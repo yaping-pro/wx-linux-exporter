@@ -185,6 +185,7 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 </p>
 
 > ⚠️ **群二维码时效提示**：微信群二维码有效期为 7 天（当前二维码**有效至 2026-10-20**）。若二维码已过期，请查阅仓库最新提交或开 Issue 提醒维护者更新。  
+> 💡 **长期稳定的备用频道**：微信群二维码 7 天即过期，建议优先使用 Telegram 群组作为持久交流渠道 👉 **[t.me/WeChatExporter](https://t.me/WeChatExporter)**。
 <!-- Maintainer note: rotate assets/wechat-group-qr.png when the group QR expires. -->
 
 ---
