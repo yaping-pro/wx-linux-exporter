@@ -72,12 +72,26 @@ jobs:
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
           sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          python3 - "${{ github.ref_name }}" <<'PY'
+          import pathlib, re, sys
+          tag = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pat = rf"^## \[{re.escape(tag)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          m = re.search(pat, text, re.S | re.M)
+          body = (m.group(1).strip() if m else "") or f"Release {tag} — see CHANGELOG.md"
+          pathlib.Path("RELEASE_NOTES.md").write_text(body + "\n", encoding="utf-8")
+          print(body[:500])
+          PY
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.ARCHIVE_NAME }}.sha256
+          body_path: RELEASE_NOTES.md
           draft: false
           prerelease: false
           generate_release_notes: false
