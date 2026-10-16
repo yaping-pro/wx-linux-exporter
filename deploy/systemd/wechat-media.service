@@ -1,0 +1,24 @@
+[Unit]
+Description=WeChat Media Enrichment Worker (optional: attachment parsing + voice transcription)
+Documentation=file://__WXHOME__/.local/share/wechat-vault/docs/MEDIA_ENRICHMENT.md
+After=network-online.target wechat-decrypt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__WXUSER__
+Group=__WXUSER__
+WorkingDirectory=__WXHOME__/.local/share/wechat-vault
+Environment=WECHAT_VAULT_ROOT=__WXHOME__/.local/share/wechat-vault
+# Optional credential for the MinerU "precise" channel (files >10MB, html/doc/xls/ppt).
+# The token-free "agent" channel needs no credential. To enable the precise channel:
+#   sudo systemd-creds encrypt --name=mineru-token --with-key=host - \
+#        /etc/wechat-vault/mineru-token.cred
+# then uncomment the line below and `systemctl daemon-reload`.
+#LoadCredentialEncrypted=mineru-token:/etc/wechat-vault/mineru-token.cred
+ExecStart=/usr/bin/python3 __WXHOME__/.local/share/wechat-vault/bin/wechat_media.py --policy __WXHOME__/.local/share/wechat-vault/config/media_policy.json --vault __WXHOME__/.local/share/wechat-vault
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal

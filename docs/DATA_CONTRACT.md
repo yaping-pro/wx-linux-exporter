@@ -1,6 +1,22 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.0.2` (2026-10-13)
+> **版本**：`v1.1.0` (2026-10-16)
+
+> ## ⚠️ v1.1 语义变更（启用「媒体富化」后生效）
+>
+> 自 v1.1.0 起，本契约支持一个**可选**的媒体富化层（见 [`MEDIA_ENRICHMENT.md`](MEDIA_ENRICHMENT.md)）。
+> **默认关闭**：未启用时，本契约与 v1.0.x **完全一致**。一旦启用，以下三条语义发生变化：
+>
+> | # | 变更 | 对消费端的要求 |
+> | :--- | :--- | :--- |
+> | 1 | **`text` 不再是"静态原文"**。媒体消息的 `text` 可能被填充（语音→转写文本；文件→原文 XML **追加**解析出的 Markdown） | **严禁把 `text` 用作去重键或缓存键**。同一消息的 `text` 会随解析完成而变化 |
+> | 2 | **`watermark` 不再严格单调**。若批次内含"尚未就绪"的媒体消息，服务端会把 `watermark` 回退到该消息之前，以便消费端复拉 | 消费端**必须**接受 `watermark` 回退，且**不得**假设 `新 watermark ≥ 旧 watermark`；幂等由 `manifest.sha256` + 稳定的消息标识保证 |
+> | 3 | 富化只作用于**白名单会话**，且可通过策略随时收窄 | 收窄白名单后，该会话的富化内容不再注入（`text` 退回基线形态） |
+>
+> **推荐的稳定消息标识**（不含 `text`）：
+> `MsgUID = SHA256(chat_id_or_name + "|" + ts + "|" + sender)`
+>
+> 若你此前按 v1.0.x 的伪代码把 `text` 纳入了 `MsgUID`，**升级前必须改掉**，否则富化生效后同一消息会因 `text` 变化而产生新 UID，导致**重复入库**。
 > **适用范围**：`wx-pad-exporter` (安卓 Pad 守护进程) 及 Linux 家服 (`wechat-export-api`)  
 > **Schema 定义**：[`schema/export.schema.json`](../schema/export.schema.json)
 
@@ -125,7 +141,7 @@
 | `exported_at` | string (RFC3339) | 导出快照生成的时间点（服务器上海时区） |
 | `range.from` | string (RFC3339) | 实际查询范围起始时间点 |
 | `range.to` | string (RFC3339) | 实际查询范围结束时间点 |
-| `watermark` | string (RFC3339) | **增量同步游标**。当前批次所有消息中的最大 `ts`；若无新消息则退化为 `range.to` |
+| `watermark` | string (RFC3339) | **增量同步游标**。通常为本批次最大 `ts`；若无新消息则退化为 `range.to`。**v1.1**：启用媒体富化且存在未就绪媒体时，会**回退**到该消息之前（见顶部语义变更 #2），消费端不得假设其单调递增 |
 | `chats` | array | 按会话聚合的消息数组 |
 | `manifest.sha256` | string (hex, 64) | 依据规范化 JSON 规则计算的 `chats` 数组 SHA-256 校验和 |
 | `manifest.message_count` | int | 整个快照包含的消息物理总条数 |
@@ -146,7 +162,7 @@
 | `ts` | string (RFC3339) | 消息创建/接收时间戳，精确至秒，带时区偏移 |
 | `sender` | string | 发送者身份。私聊为发言人标识；群聊为发言人 `wxid` 或展示昵称；本机发送为 `"我"` 或 `"self"` |
 | `kind` | string | 归一化消息类型枚举：`"text"`, `"image"`, `"voice"`, `"video"`, `"file"`, `"link"`, `"other"` |
-| `text` | string | 纯文本内容或卡片/文件/链接的原始 XML 内容（媒体类消息为空字符串） |
+| `text` | string | 纯文本内容或卡片/文件/链接的原始 XML 内容；媒体类消息在**基线模式**下为空字符串。**v1.1**：启用媒体富化后，语音会填入转写文本、文件会在原 XML 之后追加解析出的 Markdown（见顶部语义变更 #1）。**不得作为去重键** |
 | `note` | string | 消息类型的辅助注释标签（如 `"图片"`, `"语音"`, `"卡片/链接/文件"`） |
 
 ---
@@ -256,7 +272,8 @@ Algorithm IncrementalWeChatSync:
        For each Chat in Payload.chats:
            For each Msg in Chat.messages:
                // Compose unique message dedupe identity
-               MsgUID = SHA256(Chat.name + "|" + Msg.ts + "|" + Msg.sender + "|" + Msg.text)
+               // v1.1: 去重键不含 Msg.text（text 会随媒体富化而变化）
+               MsgUID = SHA256(Chat.name + "|" + Msg.ts + "|" + Msg.sender)
                If MsgUID not in StorageState.seen_messages:
                    IngestIntoAssistant(Chat, Msg)
                    StorageState.seen_messages.add(MsgUID)

@@ -11,6 +11,10 @@
 本指南汇总了将 `wx-pad-exporter`（或家服 `wechat-export-api`）输出的微信聊天流无缝接入外部智能体的标准实践方案。涵盖以下典型集成场景：
 1. **Muse.ai 风格智能体 (Poll & Digest / 早报生成器)**：定时轮询时间切片数据、校验防篡改签名并生成晨间简报。
 2. **Grok / 聊天机器人风格 (Webhook Push / 事件流驱动)**：基于 `clients/assistant_webhook.py` 向 Dify、飞书机器人或通用 OpenAI 格式 Webhook 实时分发。
+> ⚠️ **去重键必须稳定（v1.1）**：启用媒体富化后，同一消息的 `text` 会随解析完成而变化，
+> `watermark` 也可能回退。因此**严禁**把 `text` 用作去重键或缓存键，也不要假设 `watermark` 单调递增。
+> 推荐键：`SHA256(chat + "|" + ts + "|" + sender)`。详见 [`DATA_CONTRACT.md`](DATA_CONTRACT.md) v1.1。
+
 3. **通用编程智能体 (Coding Agent / OMP / Claude Code / Codex)**：智能体在开发或排障会话中通过命令行直接查证微信数据。
 
 ---

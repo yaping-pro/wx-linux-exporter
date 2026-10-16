@@ -61,4 +61,9 @@ sudo systemctl enable --now wechat-runner.service
 sudo systemctl enable --now wechat-decrypt.timer
 sudo systemctl enable --now wechat-export-api.service
 
+# Media enrichment worker (optional layer). Safe to enable unconditionally:
+# it is a no-op until config/media_policy.json sets "enabled": true.
+sudo systemctl enable --now wechat-media.timer
+
 echo "== systemd units installed and enabled for user ${WX_USER} =="
+echo "   note: wechat-media.timer is a NO-OP until config/media_policy.json sets \\"enabled\\": true"

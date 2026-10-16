@@ -71,4 +71,29 @@ else
 fi
 
 
+echo "6. Media enrichment layer (optional, off by default)..."
+MEDIA_WORKER="$(dirname "$0")/../bin/wechat_media.py"
+MEDIA_CLIENT="$(dirname "$0")/../bin/mineru_agent.py"
+MEDIA_POLICY="$VAULT_ROOT/config/media_policy.json"
+if [[ -f "$MEDIA_WORKER" && -f "$MEDIA_CLIENT" ]]; then
+    echo "  [OK] worker + MinerU client present"
+    python3 "$MEDIA_WORKER" --help >/dev/null 2>&1 && echo "  [OK] worker CLI loads" || echo "  [FAIL] worker CLI failed to load"
+    python3 "$MEDIA_CLIENT" --help >/dev/null 2>&1 && echo "  [OK] MinerU client CLI loads" || echo "  [FAIL] MinerU client CLI failed to load"
+    if [[ -f "$MEDIA_POLICY" ]]; then
+        if python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get('enabled') else 1)" "$MEDIA_POLICY"; then
+            echo "  [OK] media_policy.json present and enabled=true"
+            python3 "$MEDIA_WORKER" --policy "$MEDIA_POLICY" --vault "$VAULT_ROOT" --dry-run >/dev/null 2>&1 \
+                && echo "  [OK] dry-run completed" || echo "  [WARN] dry-run returned non-zero (check policy / vault paths)"
+        else
+            echo "  [INFO] media_policy.json present but enabled=false (layer is a no-op)"
+        fi
+    else
+        echo "  [INFO] no media_policy.json -> layer disabled (cp config/media_policy.example.json to enable)"
+    fi
+    command -v curl >/dev/null 2>&1 && echo "  [OK] curl present (required for uploads)" || echo "  [WARN] curl not found (required for MinerU uploads)"
+else
+    echo "  [WARN] media enrichment components missing from bin/"
+fi
+
+
 echo "=== Self-check completed ==="

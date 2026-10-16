@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic WeChat Media Enrichment (no-op until config/media_policy.json enables it)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
