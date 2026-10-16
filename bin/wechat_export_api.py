@@ -601,6 +601,7 @@ def create_server(
         "token": token,
         "auth_enabled": auth_enabled,
         "allowlist": allowlist or [],
+        "blocklist": blocklist or [],
     }
     try:
         from http.server import ThreadingHTTPServer
