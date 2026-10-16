@@ -20,6 +20,7 @@
 - [⚠️ 运行环境真实性验证声明 (Homelab vs VPS)](#️-运行环境真实性验证声明-homelab-vs-vps)
 - [🤖 交给你的 AI Agent (Autonomous Agent Runbook)](#-交给你的-ai-agent-autonomous-agent-runbook)
 - [💡 项目定位与核心特性](#-项目定位与核心特性)
+- [🧩 媒体富化（可选层：附件解析 / 语音转写）](#-媒体富化可选层附件解析--语音转写)
 - [🛠️ 从源码安装与构建](#️-从源码安装与构建)
 - [⚙️ 服务编排与 Systemd 配置](#️-服务编排与-systemd-配置)
 - [🤖 接入个人 AI 助理 (Muse 早报 / Webhook)](#-接入个人-ai-助理-muse-早报--webhook)
@@ -92,6 +93,7 @@ python3 bin/wechat_export_api.py --config config/export_service.json
 - **WAL 帧无损合并**：原生实现 `wechat_wal.py` 帧解析与内存合并，离线导出即可捕获最新实时消息。
 - **原子版本发布**：采用 `<UTC_TS>-<PID>` 版本树，经 `os.replace` 原子切换 `current` 软链接，支持毫秒级一键回滚 (`vault-rollback.sh`)。
 - **双端同构数据契约**：与手机端 `wx-pad-exporter` 共享相同的 `export.schema.json` 规范与 SHA-256 数据防篡改签名。
+- **🧩 媒体富化（可选层，默认关闭）**：把媒体占位符变成可读内容——**文件附件**（pdf/docx/xlsx/pptx/html）走 MinerU 解析，**语音**直接读取微信客户端自带的语音转文字结果（零成本、无网络）。让下游 AI 助理不只知道"这里有个文件/语音"，而是真的读到内容。
 
 ---
 
@@ -107,6 +109,34 @@ pip3 install pycryptodome zstandard
 # 运行语法与规范检查
 bash scripts/selfcheck.sh
 ```
+
+---
+
+### 🧩 媒体富化（可选层：附件解析 / 语音转写）
+
+> **默认关闭**。不改契约结构（无新增字段/端点/键名），开启后按 [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md) v1.1 的三条语义变更执行。
+> 完整说明见 **[`docs/MEDIA_ENRICHMENT.md`](docs/MEDIA_ENRICHMENT.md)**。
+
+| 能力 | 来源 | 成本 |
+| :--- | :--- | :--- |
+| 文件附件（pdf/docx/pptx/xlsx） | MinerU **agent 通道（免 token）** | ≤10MB / ≤20 页，免费 |
+| 文件附件（html/doc/xls/ppt、>10MB） | MinerU **precise 通道（可选 token）** | ≤200MB / ≤200 页 |
+| **语音** | **微信客户端自带语音转文字** | **零成本**：纯读本地 `packed_info_data`，无网络/无模型 |
+| 图片 / 视频 | 不支持 | 见文档 §9 |
+
+```bash
+# 1) 生成策略（默认 enabled=false）
+cp config/media_policy.example.json config/media_policy.json
+# 2) 填会话白名单（用 xxx@chatroom / wxid_xxx 稳定 ID），设 enabled=true
+# 3) 干跑：只列清单，不上传、不花钱
+python3 bin/wechat_media.py --policy config/media_policy.json --dry-run -v
+# 4) 放行
+sudo systemctl enable --now wechat-media.timer
+```
+
+**三层闸**：会话白名单 → 类型/扩展名 → 日预算 + md5 去重。任一不过就不花钱，且跳过原因全部记入 `state/media_ledger.json` 的 `deny_reason` 供审计。
+
+**凭据**：agent 通道**无需任何凭据**；仅 precise 通道需要 MinerU token，通过 `systemd-creds` 加密凭据 / 0600 文件 / 环境变量在本机注入。**本仓库不含任何令牌。**
 
 ---
 

@@ -44,6 +44,67 @@ except ImportError:
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
+# ── 媒体富化（可选，默认关闭）──────────────────────────────────────────────────
+# 设计原则：不新增响应字段、不新增端点、不改任何既有键名。
+# 富化结果只做两件事：
+#   1) 把已解析文本注入既有 `text`（图片/语音原本为空 → 填入；文件原本是 appmsg XML → 追加）
+#   2) 未就绪的媒体消息暂不推进 watermark，避免下游永久错过内容
+# 详见 docs/MEDIA_ENRICHMENT.md 与 docs/DATA_CONTRACT.md（v1.1 语义变更）。
+MEDIA_VAULT_ROOT = Path(
+    os.environ.get("WECHAT_VAULT_ROOT", str(Path.home() / ".local/share" / "wechat-vault"))
+).expanduser()
+MEDIA_POLICY_PATH = Path(
+    os.environ.get("WECHAT_MEDIA_POLICY", str(MEDIA_VAULT_ROOT / "config" / "media_policy.json"))
+).expanduser()
+MEDIA_LEDGER_PATH = Path(
+    os.environ.get("WECHAT_MEDIA_LEDGER", str(MEDIA_VAULT_ROOT / "state" / "media_ledger.json"))
+).expanduser()
+_MEDIA_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def load_json_cached(path: Path) -> dict[str, Any]:
+    """按 mtime 缓存的 JSON 读取：既避免每请求 IO，又保证改策略后即时生效。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = str(path)
+    hit = _MEDIA_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime:
+        return hit[1]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _MEDIA_CACHE[key] = (st.st_mtime, data)
+    return data
+
+
+def load_media_context() -> dict[str, Any]:
+    """汇总媒体注入所需的策略与账本上下文；任何异常都退化为「不注入、不挂水位」。"""
+    policy = load_json_cached(MEDIA_POLICY_PATH)
+    render = policy.get("render") or {}
+    readiness = policy.get("readiness") or {}
+    enabled = bool(policy.get("enabled")) and bool(render.get("inject_into_text"))
+    if not enabled:
+        return {"enabled": False}
+    ledger = load_json_cached(MEDIA_LEDGER_PATH)
+    return {
+        "enabled": True,
+        "assets": ledger.get("assets") or {},
+        "index": ledger.get("by_message") or {},
+        "allow_chats": {c for c in (policy.get("chat_allowlist") or []) if c},
+        "allow_ext": {str(e).lower().lstrip(".") for e in (policy.get("file_ext_allow") or [])},
+        "skip_ext": {str(e).lower().lstrip(".") for e in (policy.get("skip_ext") or [])},
+        "max_chars": int(render.get("max_chars_per_doc") or 4000),
+        "pending_window": int(readiness.get("max_pending_age_s") or 1800),
+        "max_bytes": int(policy.get("max_bytes") or 0),
+        "voice": bool((policy.get("kinds") or {}).get("voice")),
+    }
+
+
 
 def format_rfc3339(epoch_sec: float | int) -> str:
     """Format an epoch timestamp in seconds to RFC3339 string in Asia/Shanghai timezone."""
@@ -217,6 +278,9 @@ def export_wechat_data(
 ) -> dict[str, Any]:
     """Exports decrypted WeChat messages within the specified time range."""
     contacts = load_contacts(vault_dir)
+    now_epoch = time.time()
+    media = load_media_context()
+    hold_epoch: float | None = None
 
     # Build md5 -> username map from contacts
     md5_to_user: dict[str, str] = {}
@@ -341,6 +405,46 @@ def export_wechat_data(
 
                     if not sender_display:
                         sender_display = "我"
+                    # ── 媒体注入 / 水位保持（不改字段、不加端点）────────────
+                    if media.get("enabled"):
+                        mkey = f"{chat_id}|{local_id}"
+                        asset = media["assets"].get(media["index"].get(mkey) or "")
+                        if (asset and asset.get("state") == "ready"
+                                and chat_id in media["allow_chats"]):
+                            head = str(asset.get("text_head") or "")[: media["max_chars"]]
+                            if head:
+                                # 图片/语音原本 text 为空 → 直接填入；文件原本是 appmsg XML → 追加
+                                text = head if not text else f"{text}\n\n{head}"
+                        elif kind == "file" and chat_id in media["allow_chats"]:
+                            mm = re.search(r"<md5>([0-9a-f]{32})</md5>", decoded or "")
+                            if mm:
+                                settled = (
+                                    media["assets"].get(mm.group(1).lower()) or {}
+                                ).get("state") in ("ready", "skipped", "failed")
+                                if not settled:
+                                    mext = re.search(r"<fileext>(.*?)</fileext>", decoded or "")
+                                    ext = re.sub(
+                                        r"[^a-z0-9]", "", (mext.group(1) if mext else "").lower()
+                                    )
+                                    mlen = re.search(r"<totallen>(\d+)</totallen>", decoded or "")
+                                    size = int(mlen.group(1)) if mlen else 0
+                                    parseable = (
+                                        (not media["skip_ext"] or ext not in media["skip_ext"])
+                                        and (not media["allow_ext"] or ext in media["allow_ext"])
+                                        and (not media["max_bytes"] or not size
+                                             or size <= media["max_bytes"])
+                                    )
+                                    if (parseable
+                                            and create_time > now_epoch - media["pending_window"]):
+                                        if hold_epoch is None or create_time < hold_epoch:
+                                            hold_epoch = create_time
+                        elif (kind == "voice" and media.get("voice")
+                                and chat_id in media["allow_chats"]):
+                            # 语音转写异步到达：未就绪且仍在等待窗口内 → 暂不推进水位
+                            if not (asset and asset.get("state") == "ready"):
+                                if create_time > now_epoch - media["pending_window"]:
+                                    if hold_epoch is None or create_time < hold_epoch:
+                                        hold_epoch = create_time
 
                     ts_str = format_rfc3339(create_time)
                     if create_time > max_message_time:
@@ -369,6 +473,11 @@ def export_wechat_data(
     manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
 
     watermark_epoch = max_message_time if total_message_count > 0 else to_epoch
+    # 媒体尚未就绪时暂不推进水位：下游会用 watermark 作为下次 since 复拉，
+    # 否则「先以空 text 导出、水位越过、解析好了也永远读不到」。
+    # 注意：这使 watermark 不再严格单调（详见 docs/DATA_CONTRACT.md v1.1）。
+    if hold_epoch is not None:
+        watermark_epoch = min(watermark_epoch, hold_epoch - 1.0)
     watermark_str = format_rfc3339(watermark_epoch)
 
     now_epoch = time.time()

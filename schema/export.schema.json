@@ -40,7 +40,7 @@
     "watermark": {
       "type": "string",
       "format": "date-time",
-      "description": "Cursor for incremental sync: the max message timestamp in this payload, or 'to' if empty."
+      "description": "Cursor for incremental sync: the max message timestamp in this payload, or 'to' if empty. v1.1: when media enrichment is enabled and a batch contains not-yet-ready media, the server rolls this back to before that message so consumers re-fetch it. Consumers must not assume it is monotonically increasing."
     },
     "chats": {
       "type": "array",
@@ -148,7 +148,7 @@
         },
         "text": {
           "type": "string",
-          "description": "Plain text content or raw XML payload for complex AppMsg cards."
+          "description": "Plain text content, or raw XML payload for complex AppMsg cards. Baseline mode: media messages carry an empty string. v1.1 media-enrichment: voice messages carry the transcription and file messages carry the original XML with parsed Markdown appended. NOTE: text may change over time for the same message - never use it as a dedupe or cache key."
         },
         "note": {
           "type": "string",

@@ -32,6 +32,29 @@
     ssh -L 8765:127.0.0.1:8765 user@homelab-host
     ```
 
+### 5. 媒体富化：文件解析不出来 / 语音没有文本
+
+先看账本里的 `deny_reason`（这是唯一权威判据，不要靠猜）：
+
+```bash
+python3 -c "import json;d=json.load(open('state/media_ledger.json'));\
+from collections import Counter;print(Counter(v.get('deny_reason') for v in d['assets'].values()))"
+```
+
+| 现象 | 原因 | 处置 |
+| :--- | :--- | :--- |
+| 大量 `agent_unsupported` | 该格式 agent 通道不支持（html/doc/xls/ppt） | 配置 precise 凭据 |
+| 大量 `missing_source` | 消息有记录但磁盘无实体——微信**点击才下载**，headless 客户端不会自动落盘所有附件 | 属正常现象；可在客户端点开该文件后再跑一轮 |
+| `oversize` / `page_limit` | 超出通道上限 | 配 precise，或手动 `--pages` |
+| 语音全部 `voice_not_transcribed` | 客户端未开启自动转写，或语音在开启之前收到 | 开启 `Auto-convert voice messages to text`；历史语音需在客户端手动点 "Convert to text" |
+| `no_credential` | 路由到了 precise 但没有 token | 见 [`MEDIA_ENRICHMENT.md`](MEDIA_ENRICHMENT.md) §6 |
+| 日志无 `precise_token=available` | 凭据未挂载 | 检查 `LoadCredentialEncrypted=` 是否取消注释并 `daemon-reload` |
+
+其它要点：
+- **`msg/file` 是活动目录**：worker 会先复制到 `staging/` 并校验大小稳定；若某文件持续失败，多半是微信仍在写入。
+- **`hardlink.db` 表结构随微信版本变化**：升级微信后如出现大面积 `missing_source`，先核对 `file_hardlink_info_v4` 是否仍存在。
+- **确认 worker 真的在跑**：`systemctl list-timers wechat-media.timer`；策略 `enabled=false` 时它每轮都是 no-op（这是设计行为）。
+
 ---
 
 ## English

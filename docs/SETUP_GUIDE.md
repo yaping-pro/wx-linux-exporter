@@ -15,6 +15,19 @@
 ### 2. 部署与配置步骤
 详见根目录 [AGENT.md](../AGENT.md) 或 [README.md](../README.md)。
 
+#### 可选：启用媒体富化（默认关闭）
+
+```bash
+cp config/media_policy.example.json config/media_policy.json   # enabled 默认 false
+$EDITOR config/media_policy.json        # 填 chat_allowlist（xxx@chatroom / wxid_xxx），设 enabled=true
+python3 bin/wechat_media.py --policy config/media_policy.json --dry-run -v   # 干跑，不上传
+sudo systemctl enable --now wechat-media.timer
+```
+
+- 文件解析：默认走 MinerU **免 token** 通道（≤10MB/≤20 页）；需要 html/doc/xls/ppt 或更大文件时再配 precise 凭据（见 [`MEDIA_ENRICHMENT.md`](MEDIA_ENRICHMENT.md) §6）。
+- 语音转写：需在**微信客户端**开启 `设置 → General → Features → Auto-convert voice messages to text`；worker 侧零配置、零成本。
+- 启用前请先读 [`DATA_CONTRACT.md`](DATA_CONTRACT.md) 顶部的 **v1.1 语义变更**（`text` 不可作去重键、`watermark` 可能回退）。
+
 ---
 
 ## English

@@ -44,6 +44,10 @@ jobs:
         run: |
           python3 clients/test_assistant_webhook.py
 
+      - name: Media enrichment regression tests
+        run: |
+          python3 tests/test_wechat_media.py
+
   release:
     needs: lint-and-test
     if: startsWith(github.ref, 'refs/tags/v')

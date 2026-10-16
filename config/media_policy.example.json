@@ -1,0 +1,26 @@
+{
+  "enabled": false,
+  "chat_allowlist": [],
+  "kinds": {
+    "file": true,
+    "image": false,
+    "voice": true,
+    "video": false
+  },
+  "file_ext_allow": ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "htm", "md", "txt", "csv"],
+  "skip_ext": ["zip", "rar", "7z", "gz", "svg", "m4a", "mp3", "mp4"],
+  "max_bytes": 10485760,
+  "precise": {
+    "enabled": true,
+    "max_bytes": 209715200,
+    "model": "vlm",
+    "token_file": null
+  },
+  "max_items_per_run": 10,
+  "daily_file_budget": 30,
+  "lookback_hours": 72,
+  "initial_since_days": 7,
+  "dedupe": { "by": "md5", "ttl_days": 180 },
+  "readiness": { "max_pending_age_s": 1800, "max_parse_retries": 2 },
+  "render": { "max_chars_per_doc": 4000, "inject_into_text": true }
+}

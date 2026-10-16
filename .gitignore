@@ -53,3 +53,9 @@ vault.db*
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Media enrichment runtime artifacts (contain local paths / real chat IDs)
+state/
+exports/
+staging/
+config/media_policy.json
