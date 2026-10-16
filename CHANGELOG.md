@@ -11,6 +11,12 @@
 
 ---
 
+## [v1.1.1] - 2026-10-16
+### Fixed
+- **P0 `blocklist` 被静默忽略（隐私/安全面）**：`create_server()` 构造 `server_context` 时漏传 `blocklist`，导致**任何** blocklist 都不生效——被屏蔽的会话会照常出现在导出结果中。由于 `main()` 同样经由 `create_server`，该缺陷对生产部署同样生效（仅因默认 `blocklist: []` 而未暴露）。已补回该键，并新增端到端回归测试 `tests/test_chat_filtering.py`（起真实回环服务断言屏蔽会话被排除、无 token 返回 401）；已反向验证：回退修复则该测试失败。
+
+---
+
 ## [v1.1.0] - 2026-10-16
 
 ### Added

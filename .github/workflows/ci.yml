@@ -44,9 +44,12 @@ jobs:
         run: |
           python3 clients/test_assistant_webhook.py
 
-      - name: Media enrichment regression tests
+      - name: Regression tests (media enrichment + chat filtering)
         run: |
-          python3 tests/test_wechat_media.py
+          for t in tests/test_*.py; do
+            echo "== ${t}"
+            python3 "${t}"
+          done
 
   release:
     needs: lint-and-test
