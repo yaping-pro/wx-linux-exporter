@@ -66,6 +66,36 @@ MEDIA_LEDGER_PATH = Path(
     os.environ.get("WECHAT_MEDIA_LEDGER", str(MEDIA_VAULT_ROOT / "state" / "media_ledger.json"))
 ).expanduser()
 _MEDIA_CACHE: dict[str, tuple[float, dict]] = {}
+ALLOWED_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
+
+
+def get_media_paths(server_context: dict[str, Any] | None = None) -> tuple[Path, Path, Path]:
+    """解析 (media_vault_root, media_policy_path, media_ledger_path)。"""
+    ctx = server_context or {}
+    if ctx.get("media_vault_root"):
+        vroot = Path(ctx["media_vault_root"]).expanduser()
+        pol = Path(ctx.get("media_policy_path") or (vroot / "config" / "media_policy.json"))
+        led = Path(ctx.get("media_ledger_path") or (vroot / "state" / "media_ledger.json"))
+        return vroot, pol, led
+    if ctx.get("media_policy_path") or ctx.get("media_ledger_path"):
+        vroot = Path(ctx.get("vault_dir", MEDIA_VAULT_ROOT)).expanduser()
+        pol = Path(ctx.get("media_policy_path") or (vroot / "config" / "media_policy.json"))
+        led = Path(ctx.get("media_ledger_path") or (vroot / "state" / "media_ledger.json"))
+        return vroot, pol, led
+
+    vdir = Path(ctx.get("vault_dir", MEDIA_VAULT_ROOT)).expanduser()
+    if (vdir / "state" / "media_ledger.json").exists():
+        return vdir, vdir / "config" / "media_policy.json", vdir / "state" / "media_ledger.json"
+    if (vdir.parent / "state" / "media_ledger.json").exists():
+        return vdir.parent, vdir.parent / "config" / "media_policy.json", vdir.parent / "state" / "media_ledger.json"
+    if (vdir.parent.parent / "state" / "media_ledger.json").exists():
+        return (
+            vdir.parent.parent,
+            vdir.parent.parent / "config" / "media_policy.json",
+            vdir.parent.parent / "state" / "media_ledger.json",
+        )
+
+    return MEDIA_VAULT_ROOT, MEDIA_POLICY_PATH, MEDIA_LEDGER_PATH
 
 
 def load_json_cached(path: Path) -> dict[str, Any]:
@@ -88,28 +118,33 @@ def load_json_cached(path: Path) -> dict[str, Any]:
     return data
 
 
-def load_media_context() -> dict[str, Any]:
+def load_media_context(server_context: dict[str, Any] | None = None) -> dict[str, Any]:
     """汇总媒体注入所需的策略与账本上下文；任何异常都退化为「不注入、不挂水位」。"""
-    policy = load_json_cached(MEDIA_POLICY_PATH)
+    _vroot, policy_path, ledger_path = get_media_paths(server_context)
+    policy = load_json_cached(policy_path)
     render = policy.get("render") or {}
     readiness = policy.get("readiness") or {}
-    enabled = bool(policy.get("enabled")) and bool(render.get("inject_into_text"))
+    kinds = policy.get("kinds") or {}
+    image_cfg = policy.get("image") or {}
+    enabled = bool(policy.get("enabled"))
     if not enabled:
         return {"enabled": False}
-    ledger = load_json_cached(MEDIA_LEDGER_PATH)
+    ledger = load_json_cached(ledger_path)
     return {
         "enabled": True,
         "assets": ledger.get("assets") or {},
         "index": ledger.get("by_message") or {},
+        "anchors": ledger.get("anchors") or {},
         "allow_chats": {c for c in (policy.get("chat_allowlist") or []) if c},
         "allow_ext": {str(e).lower().lstrip(".") for e in (policy.get("file_ext_allow") or [])},
         "skip_ext": {str(e).lower().lstrip(".") for e in (policy.get("skip_ext") or [])},
         "max_chars": int(render.get("max_chars_per_doc") or 4000),
+        "inject_into_text": bool(render.get("inject_into_text")),
         "pending_window": int(readiness.get("max_pending_age_s") or 1800),
         "max_bytes": int(policy.get("max_bytes") or 0),
-        "voice": bool((policy.get("kinds") or {}).get("voice")),
+        "voice": bool(kinds.get("voice")),
+        "image": bool(kinds.get("image") or image_cfg.get("enabled")),
     }
-
 
 
 def format_rfc3339(epoch_sec: float | int) -> str:
@@ -197,6 +232,34 @@ def map_message_type(local_type: int, raw_text: str) -> tuple[str, str, str]:
         return "other", raw_text, "其他"
 
 
+def image_note(asset: dict[str, Any] | None) -> str:
+    """根据 ledger 中图片资产的 state 与 deny_reason 映射细化 note。"""
+    if not asset:
+        return "图片"
+    state = asset.get("state")
+    reason = str(asset.get("deny_reason") or "")
+
+    if state == "ready":
+        return "图片"
+    elif state == "pending" or reason == "image_not_on_disk":
+        return "图片（处理中）"
+    elif state == "skipped":
+        if reason == "missing_source":
+            return "图片（未下载）"
+        elif reason == "skipped:animated":
+            return "图片（动图）"
+        elif reason == "max_pixels_exceeded":
+            return "图片（超大）"
+        elif reason in ("missing_keys", "skipped:decryptor_unavailable"):
+            return "图片（不可解密）"
+        elif reason.startswith("unresolved:"):
+            return "图片（无法定位）"
+        return "图片"
+    elif state == "failed":
+        return "图片（解析失败）"
+    return "图片"
+
+
 def load_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
     """Loads contacts from contact/contact.db."""
     contacts: dict[str, dict[str, Any]] = {}
@@ -248,6 +311,201 @@ def load_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
     return contacts
 
 
+_CONTACTS_CACHE: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+
+
+def get_cached_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
+    """按 mtime 缓存的联系人与会话列表读取。"""
+    c_path = vault_dir / "contact" / "contact.db"
+    s_path = vault_dir / "session" / "session.db"
+    mtime = 0.0
+    for p in (c_path, s_path):
+        if p.exists():
+            try:
+                mtime = max(mtime, p.stat().st_mtime)
+            except OSError:
+                pass
+    key = str(vault_dir.resolve())
+    hit = _CONTACTS_CACHE.get(key)
+    if hit is not None and hit[0] == mtime and mtime > 0:
+        return hit[1]
+
+    contacts = load_contacts(vault_dir)
+    if s_path.exists():
+        try:
+            uri = f"{s_path.resolve().as_uri()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+        except Exception:
+            con = sqlite3.connect(str(s_path))
+        try:
+            cursor = con.execute("PRAGMA table_info(SessionTable)")
+            cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
+            if "username" in cols:
+                u_col = cols["username"]
+                d_col = (
+                    cols.get("display_name")
+                    or cols.get("remark")
+                    or cols.get("nick_name")
+                    or cols.get("last_sender_display_name")
+                )
+                if d_col:
+                    for row in con.execute(f"SELECT {u_col}, {d_col} FROM SessionTable"):
+                        u = str(row[0] or "")
+                        d = str(row[1] or "").strip()
+                        if u and d and u not in contacts:
+                            contacts[u] = {
+                                "username": u,
+                                "display_name": d,
+                                "is_group": u.endswith("@chatroom"),
+                            }
+        except Exception:
+            pass
+        finally:
+            con.close()
+
+    _CONTACTS_CACHE[key] = (mtime, contacts)
+    return contacts
+
+
+def resolve_chat_name(
+    chat_id: str,
+    vault_dir: Path,
+    contacts: dict[str, Any] | None = None,
+) -> str:
+    """解析会话可读显示名：优先 contact.db 备注/群名，次选 session.db，取不到回退 chat_id。"""
+    if contacts is None:
+        contacts = get_cached_contacts(vault_dir)
+    cinfo = contacts.get(chat_id)
+    if cinfo and cinfo.get("display_name"):
+        return str(cinfo["display_name"])
+    return chat_id
+
+
+def fetch_message_context(
+    vault_dir: Path,
+    chat_id: str,
+    target_local_id: int,
+    target_ts: int,
+    contacts: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """在同一 chat_id 内按 local_id/ts 获取紧邻的前后最多各 2 条消息。"""
+    if contacts is None:
+        contacts = get_cached_contacts(vault_dir)
+
+    table_md5 = hashlib.md5(chat_id.encode("utf-8")).hexdigest()
+    table_name = f"Msg_{table_md5}"
+    shards = message_db_paths(vault_dir)
+
+    target_shard = None
+    for shard in shards:
+        try:
+            uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+        except Exception:
+            con = sqlite3.connect(str(shard))
+        try:
+            cur = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            if cur.fetchone():
+                target_shard = shard
+                break
+        finally:
+            con.close()
+
+    if not target_shard:
+        return [], []
+
+    n2id: dict[int, str] = {}
+    try:
+        uri = f"{target_shard.resolve().as_uri()}?mode=ro&immutable=1"
+        con = sqlite3.connect(uri, uri=True)
+    except Exception:
+        con = sqlite3.connect(str(target_shard))
+
+    try:
+        cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'")
+        if cur.fetchone():
+            for r in con.execute("SELECT rowid, user_name FROM Name2Id"):
+                if r[1]:
+                    n2id[int(r[0])] = str(r[1])
+
+        is_group = chat_id.endswith("@chatroom")
+        chat_info = contacts.get(chat_id)
+        chat_display_name = chat_info.get("display_name", chat_id) if chat_info else chat_id
+
+        def _row_to_context_item(row: tuple) -> dict[str, Any]:
+            _lid, _srv_id, ltype, rsid, ct, mc, cc = row
+            decoded = decode_content(mc, cc)
+            _kind, text, _note = map_message_type(ltype, decoded)
+
+            sender_display = "我"
+            if is_group:
+                match_sender = re.match(r"^([a-zA-Z0-9_\-]+):\n(.*)$", text, re.DOTALL)
+                if match_sender:
+                    sender_user = match_sender.group(1)
+                    text = match_sender.group(2)
+                    s_cinfo = contacts.get(sender_user)
+                    sender_display = (
+                        s_cinfo.get("display_name", sender_user)
+                        if s_cinfo
+                        else sender_user
+                    )
+                elif rsid and int(rsid) in n2id:
+                    sender_user = n2id[int(rsid)]
+                    s_cinfo = contacts.get(sender_user)
+                    sender_display = (
+                        s_cinfo.get("display_name", sender_user)
+                        if s_cinfo
+                        else sender_user
+                    )
+            else:
+                if rsid and int(rsid) in n2id:
+                    sender_user = n2id[int(rsid)]
+                    if sender_user == chat_id:
+                        sender_display = chat_display_name
+                    else:
+                        s_cinfo = contacts.get(sender_user)
+                        sender_display = (
+                            s_cinfo.get("display_name", sender_user)
+                            if s_cinfo
+                            else sender_user
+                        )
+                elif rsid == 0:
+                    sender_display = "我"
+                else:
+                    sender_display = chat_display_name
+
+            if len(text) > 200:
+                text = text[:200] + "…"
+
+            return {
+                "ts": format_rfc3339(ct),
+                "sender": sender_display,
+                "text": text,
+            }
+
+        q_before = (
+            f"SELECT local_id, server_id, local_type, real_sender_id, "
+            f"create_time, message_content, compress_content FROM [{table_name}] "
+            f"WHERE (create_time < ? OR (create_time = ? AND local_id < ?)) "
+            f"ORDER BY create_time DESC, local_id DESC LIMIT 2"
+        )
+        before_rows = con.execute(q_before, (target_ts, target_ts, target_local_id)).fetchall()
+        before = [_row_to_context_item(r) for r in reversed(before_rows)]
+
+        q_after = (
+            f"SELECT local_id, server_id, local_type, real_sender_id, "
+            f"create_time, message_content, compress_content FROM [{table_name}] "
+            f"WHERE (create_time > ? OR (create_time = ? AND local_id > ?)) "
+            f"ORDER BY create_time ASC, local_id ASC LIMIT 2"
+        )
+        after_rows = con.execute(q_after, (target_ts, target_ts, target_local_id)).fetchall()
+        after = [_row_to_context_item(r) for r in after_rows]
+
+        return before, after
+    finally:
+        con.close()
+
+
 def is_chat_allowed(
     chat_id: str,
     contact_info: dict[str, Any] | None,
@@ -281,11 +539,12 @@ def export_wechat_data(
     to_epoch: float,
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
+    server_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Exports decrypted WeChat messages within the specified time range."""
-    contacts = load_contacts(vault_dir)
+    contacts = get_cached_contacts(vault_dir)
     now_epoch = time.time()
-    media = load_media_context()
+    media = load_media_context(server_context)
     hold_epoch: float | None = None
 
     # Build md5 -> username map from contacts
@@ -411,16 +670,75 @@ def export_wechat_data(
 
                     if not sender_display:
                         sender_display = "我"
-                    # ── 媒体注入 / 水位保持（不改字段、不加端点）────────────
+                    # ── 媒体注入 / 水位保持 ─────────────────────────────
+                    media_obj = None
                     if media.get("enabled"):
                         mkey = f"{chat_id}|{local_id}"
                         asset = media["assets"].get(media["index"].get(mkey) or "")
-                        if (asset and asset.get("state") == "ready"
-                                and chat_id in media["allow_chats"]):
-                            head = str(asset.get("text_head") or "")[: media["max_chars"]]
-                            if head:
-                                # 图片/语音原本 text 为空 → 直接填入；文件原本是 appmsg XML → 追加
-                                text = head if not text else f"{text}\n\n{head}"
+                        if kind == "image" and chat_id in media["allow_chats"]:
+                            note = image_note(asset)
+                        if (
+                            asset
+                            and asset.get("state") == "ready"
+                            and chat_id in media["allow_chats"]
+                        ):
+                            if asset.get("kind") == "image":
+                                anchor = dict(
+                                    media.get("anchors", {}).get(mkey)
+                                    or asset.get("anchor")
+                                    or {}
+                                )
+                                anchor["chat_id"] = chat_id
+                                anchor["chat_name"] = chat_display_name
+                                anchor["local_id"] = int(local_id)
+                                anchor["ts"] = int(create_time)
+                                anchor["sender"] = sender_display
+
+                                ocr_raw = dict(asset.get("ocr") or {})
+                                ocr_data = {
+                                    "status": ocr_raw.get("status", "skipped"),
+                                    "text": ocr_raw.get("text", ""),
+                                    "provider": ocr_raw.get("provider", "none"),
+                                    "confidence": ocr_raw.get("confidence"),
+                                }
+                                if "lang" in ocr_raw:
+                                    ocr_data["lang"] = ocr_raw["lang"]
+                                if "version" in ocr_raw:
+                                    ocr_data["version"] = ocr_raw["version"]
+                                if "sha256" in ocr_raw:
+                                    ocr_data["sha256"] = ocr_raw["sha256"]
+
+                                media_obj = {
+                                    "asset_id": asset["asset_id"],
+                                    "kind": "image",
+                                    "quality": asset.get("quality", "full"),
+                                    "format": asset.get("format", "jpg"),
+                                    "width": asset.get("width"),
+                                    "height": asset.get("height"),
+                                    "bytes": int(asset.get("bytes") or 0),
+                                    "path": (
+                                        asset.get("path")
+                                        or f"media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                                    ),
+                                    "url": (
+                                        asset.get("url")
+                                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                                    ),
+                                    "anchor": anchor,
+                                    "source": asset.get("source") or {"dat": "", "variant": ""},
+                                    "ocr": ocr_data,
+                                }
+                                # 契约 v1.2 修正版：text 为 ocr.text 的截断投影（<=2000字）；若 empty/failed 则为空串
+                                th = asset.get("text_head")
+                                if th is None and ocr_data.get("status") == "ready" and ocr_data.get("text"):
+                                    raw_t = str(ocr_data["text"]).strip()
+                                    th = (raw_t[:2000] + "…") if len(raw_t) > 2000 else raw_t
+                                text = str(th or "")
+                            else:
+                                if media.get("inject_into_text"):
+                                    head = str(asset.get("text_head") or "")[: media["max_chars"]]
+                                    if head:
+                                        text = head if not text else f"{text}\n\n{head}"
                         elif kind == "file" and chat_id in media["allow_chats"]:
                             mm = re.search(r"<md5>([0-9a-f]{32})</md5>", decoded or "")
                             if mm:
@@ -451,18 +769,30 @@ def export_wechat_data(
                                 if create_time > now_epoch - media["pending_window"]:
                                     if hold_epoch is None or create_time < hold_epoch:
                                         hold_epoch = create_time
+                        elif (kind == "image" and media.get("image")
+                                and chat_id in media["allow_chats"]):
+                            settled = (
+                                asset and asset.get("state") in ("ready", "skipped", "failed")
+                            )
+                            if not settled:
+                                if create_time > now_epoch - media["pending_window"]:
+                                    if hold_epoch is None or create_time < hold_epoch:
+                                        hold_epoch = create_time
 
                     ts_str = format_rfc3339(create_time)
                     if create_time > max_message_time:
                         max_message_time = create_time
 
-                    chats_data[chat_id]["messages"].append({
+                    msg_dict = {
                         "ts": ts_str,
                         "sender": sender_display,
                         "kind": kind,
                         "text": text,
                         "note": note,
-                    })
+                    }
+                    if media_obj is not None:
+                        msg_dict["media"] = media_obj
+                    chats_data[chat_id]["messages"].append(msg_dict)
                     total_message_count += 1
         finally:
             con.close()
@@ -591,7 +921,11 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": str(e)})
                 return
 
-            vault_dir = Path(self.server_context.get("vault_dir", "~/.local/share/wechat-vault/decrypted/current")).expanduser()
+            vault_dir = Path(
+                self.server_context.get(
+                    "vault_dir", "~/.local/share/wechat-vault/decrypted/current"
+                )
+            ).expanduser()
             allowlist = self.server_context.get("allowlist", [])
             blocklist = self.server_context.get("blocklist", [])
 
@@ -602,10 +936,302 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     to_epoch=to_epoch,
                     allowlist=allowlist,
                     blocklist=blocklist,
+                    server_context=self.server_context,
                 )
                 self.send_json(200, result)
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
+            return
+
+        if path == "/api/wechat/media":
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            q = query.get("q", [""])[0].strip()
+            chat_id = query.get("chat_id", [""])[0].strip()
+            since_val = query.get("since", [None])[0]
+            until_val = query.get("until", [None])[0]
+            quality = query.get("quality", [""])[0].strip()
+            include_val = query.get("include", [""])[0].strip()
+            include_context = "context" in [x.strip() for x in include_val.split(",") if x.strip()]
+
+            limit_val = query.get("limit", [None])[0]
+            offset_val = query.get("offset", ["0"])[0]
+
+            max_limit = 50 if include_context else 100
+            try:
+                limit = int(limit_val) if limit_val is not None else 20
+                limit = min(max(1, limit), max_limit)
+                offset = max(0, int(offset_val))
+            except ValueError:
+                self.send_json(400, {"error": "Invalid limit or offset parameter"})
+                return
+
+            try:
+                since_ts = parse_time_param(since_val, default_epoch=0.0) if since_val else 0.0
+                until_ts = parse_time_param(until_val, default_epoch=float("inf")) if until_val else float("inf")
+            except ValueError as e:
+                self.send_json(400, {"error": str(e)})
+                return
+
+            vault_dir = Path(
+                self.server_context.get(
+                    "vault_dir", "~/.local/share/wechat-vault/decrypted/current"
+                )
+            ).expanduser()
+            contacts = get_cached_contacts(vault_dir)
+            allowlist = self.server_context.get("allowlist", [])
+            blocklist = self.server_context.get("blocklist", [])
+
+            _vroot, _pol_path, ledger_path = get_media_paths(self.server_context)
+            ledger = load_json_cached(ledger_path)
+            assets = ledger.get("assets") or {}
+            by_message = ledger.get("by_message") or {}
+            anchors_map = ledger.get("anchors") or {}
+
+            matches: list[dict[str, Any]] = []
+            seen_instances = set()
+
+            for mkey, aid in by_message.items():
+                seen_instances.add(mkey)
+                asset = assets.get(aid or "")
+                if not asset or asset.get("kind") != "image" or asset.get("state") != "ready":
+                    continue
+                anchor = dict(anchors_map.get(mkey) or asset.get("anchor") or {})
+                m_chat = anchor.get("chat_id") or (mkey.split("|")[0] if "|" in mkey else "")
+                if not m_chat:
+                    continue
+                cinfo = contacts.get(m_chat)
+                if not is_chat_allowed(m_chat, cinfo, allowlist, blocklist):
+                    continue
+                if chat_id and m_chat != chat_id:
+                    continue
+                ts = int(anchor.get("ts") or asset.get("create_time") or 0)
+                if ts < since_ts or ts > until_ts:
+                    continue
+                if quality and asset.get("quality") != quality:
+                    continue
+                ocr_dict = asset.get("ocr") or {}
+                ocr_text = str(ocr_dict.get("text") or "")
+                if q and q.lower() not in ocr_text.lower():
+                    continue
+
+                anchor["chat_id"] = m_chat
+                anchor["chat_name"] = resolve_chat_name(m_chat, vault_dir, contacts)
+                if "|" in mkey and "local_id" not in anchor:
+                    try:
+                        anchor["local_id"] = int(mkey.split("|")[1])
+                    except (ValueError, IndexError):
+                        pass
+                anchor.setdefault("ts", ts)
+                anchor.setdefault("sender", "我")
+
+                item = {
+                    "asset_id": asset["asset_id"],
+                    "anchor": anchor,
+                    "quality": asset.get("quality", "full"),
+                    "format": asset.get("format", "jpg"),
+                    "width": asset.get("width"),
+                    "height": asset.get("height"),
+                    "bytes": int(asset.get("bytes") or 0),
+                    "ocr": ocr_dict,
+                    "url": (
+                        asset.get("url")
+                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                    ),
+                }
+                matches.append(item)
+
+            for aid, asset in assets.items():
+                if asset.get("kind") != "image" or asset.get("state") != "ready":
+                    continue
+                anchor = dict(asset.get("anchor") or {})
+                m_chat = anchor.get("chat_id", "")
+                if not m_chat:
+                    continue
+                lid = anchor.get("local_id", 0)
+                mkey = f"{m_chat}|{lid}"
+                if mkey in seen_instances:
+                    continue
+                cinfo = contacts.get(m_chat)
+                if not is_chat_allowed(m_chat, cinfo, allowlist, blocklist):
+                    continue
+                if chat_id and m_chat != chat_id:
+                    continue
+                ts = int(anchor.get("ts") or asset.get("create_time") or 0)
+                if ts < since_ts or ts > until_ts:
+                    continue
+                if quality and asset.get("quality") != quality:
+                    continue
+                ocr_dict = asset.get("ocr") or {}
+                ocr_text = str(ocr_dict.get("text") or "")
+                if q and q.lower() not in ocr_text.lower():
+                    continue
+
+                anchor["chat_id"] = m_chat
+                anchor["chat_name"] = resolve_chat_name(m_chat, vault_dir, contacts)
+                item = {
+                    "asset_id": asset["asset_id"],
+                    "anchor": anchor,
+                    "quality": asset.get("quality", "full"),
+                    "format": asset.get("format", "jpg"),
+                    "width": asset.get("width"),
+                    "height": asset.get("height"),
+                    "bytes": int(asset.get("bytes") or 0),
+                    "ocr": ocr_dict,
+                    "url": (
+                        asset.get("url")
+                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                    ),
+                }
+                matches.append(item)
+
+            matches.sort(
+                key=lambda x: (
+                    int(x["anchor"].get("ts") or 0),
+                    int(x["anchor"].get("local_id") or 0),
+                ),
+                reverse=True,
+            )
+
+            paged = matches[offset: offset + limit]
+            if include_context:
+                for item in paged:
+                    anc = item["anchor"]
+                    before, after = fetch_message_context(
+                        vault_dir=vault_dir,
+                        chat_id=anc["chat_id"],
+                        target_local_id=int(anc["local_id"]),
+                        target_ts=int(anc["ts"]),
+                        contacts=contacts,
+                    )
+                    item["context"] = {"before": before, "after": after}
+
+            self.send_json(200, {
+                "items": paged,
+                "total": len(matches),
+                "limit": limit,
+                "offset": offset,
+            })
+            return
+
+        m_media_file = re.fullmatch(r"^/api/wechat/media/([0-9a-f]{32})/([^/]+)$", path)
+        if m_media_file:
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            asset_id = m_media_file.group(1).lower()
+            filename = m_media_file.group(2)
+
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if ext not in ALLOWED_IMAGE_EXTS or not re.fullmatch(r"^[a-zA-Z0-9_.-]+$", filename):
+                self.send_json(400, {"error": "Invalid filename or extension"})
+                return
+
+            vault_dir = Path(
+                self.server_context.get(
+                    "vault_dir", "~/.local/share/wechat-vault/decrypted/current"
+                )
+            ).expanduser()
+            blocklist = self.server_context.get("blocklist", [])
+            allowlist = self.server_context.get("allowlist", [])
+            contacts = get_cached_contacts(vault_dir)
+
+            _vroot, _pol_path, ledger_path = get_media_paths(self.server_context)
+            ledger = load_json_cached(ledger_path)
+            assets = ledger.get("assets") or {}
+            by_message = ledger.get("by_message") or {}
+            anchors_map = ledger.get("anchors") or {}
+
+            # 安全校验：若所属会话均被 blocklist 屏蔽或未在白名单，拒绝访问
+            associated_chats = set()
+            for mkey, aid in by_message.items():
+                if aid == asset_id and "|" in mkey:
+                    associated_chats.add(mkey.split("|")[0])
+            for _mkey, anc in anchors_map.items():
+                if anc.get("asset_id") == asset_id and anc.get("chat_id"):
+                    associated_chats.add(anc["chat_id"])
+            if asset_id in assets and assets[asset_id].get("anchor", {}).get("chat_id"):
+                associated_chats.add(assets[asset_id]["anchor"]["chat_id"])
+
+            if associated_chats:
+                allowed_any = False
+                for c in associated_chats:
+                    cinfo = contacts.get(c)
+                    if is_chat_allowed(c, cinfo, allowlist, blocklist):
+                        allowed_any = True
+                        break
+                if not allowed_any:
+                    self.send_json(404, {"error": "Not Found"})
+                    return
+
+            vroot_media = (_vroot / "media").resolve()
+            target_path = (vroot_media / asset_id / filename).resolve()
+            try:
+                target_path.relative_to(vroot_media)
+            except ValueError:
+                self.send_json(403, {"error": "Forbidden: path traversal detected"})
+                return
+
+            if not target_path.is_file():
+                asset_dir = (vroot_media / asset_id).resolve()
+                if asset_dir.is_dir():
+                    cands = [
+                        p for p in asset_dir.iterdir()
+                        if p.is_file() and p.suffix.lstrip(".").lower() in ALLOWED_IMAGE_EXTS
+                    ]
+                    if cands:
+                        target_path = cands[0]
+                        ext = target_path.suffix.lstrip(".").lower()
+
+            if not target_path.is_file():
+                self.send_json(404, {"error": "Not Found"})
+                return
+            sha256 = (assets.get(asset_id) or {}).get("sha256")
+            if not sha256:
+                try:
+                    data = target_path.read_bytes()
+                    sha256 = hashlib.sha256(data).hexdigest()
+                except OSError:
+                    self.send_json(500, {"error": "Failed to read media file"})
+                    return
+            else:
+                data = None
+
+            etag_header = f'"{sha256}"'
+            if_none_match = self.headers.get("If-None-Match", "").strip()
+            if if_none_match:
+                client_tags = [t.strip(' "') for t in if_none_match.split(",")]
+                if sha256 in client_tags:
+                    self.send_response(304)
+                    self.send_header("ETag", etag_header)
+                    self.end_headers()
+                    return
+
+            if data is None:
+                try:
+                    data = target_path.read_bytes()
+                except OSError:
+                    self.send_json(500, {"error": "Failed to read media file"})
+                    return
+
+            content_types = {
+                "jpg": "image/jpeg",
+                "jpeg": "image/jpeg",
+                "png": "image/png",
+                "gif": "image/gif",
+                "webp": "image/webp",
+            }
+            ct = content_types.get(ext, "application/octet-stream")
+
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("ETag", etag_header)
+            self.end_headers()
+            self.wfile.write(data)
             return
 
         self.send_json(404, {"error": "Not Found"})
@@ -620,6 +1246,9 @@ def create_server(
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
     briefing_path: str | None = None,
+    media_vault_root: str | None = None,
+    media_policy_path: str | None = None,
+    media_ledger_path: str | None = None,
 ) -> HTTPServer:
     """Creates an HTTPServer instance with configured server context."""
     server_context = {
@@ -629,6 +1258,9 @@ def create_server(
         "allowlist": allowlist or [],
         "blocklist": blocklist or [],
         "briefing_path": briefing_path or DEFAULT_BRIEFING_PATH,
+        "media_vault_root": media_vault_root,
+        "media_policy_path": media_policy_path,
+        "media_ledger_path": media_ledger_path,
     }
     try:
         from http.server import ThreadingHTTPServer
@@ -640,6 +1272,7 @@ def create_server(
         return WeChatExportHandler(*args, server_context=server_context, **kwargs)
 
     return server_class((host, port), handler_factory)
+
 
 def load_config_file(config_path: Path) -> dict[str, Any]:
     """Loads JSON configuration file."""

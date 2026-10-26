@@ -1,22 +1,39 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.1.0` (2026-10-16)
+> **版本**：`v1.2.0` (2026-10-27)
 
-> ## ⚠️ v1.1 语义变更（启用「媒体富化」后生效）
+> ## ⚠️ v1.2 语义扩充（新增结构化「媒体对象」与检索端点）
 >
-> 自 v1.1.0 起，本契约支持一个**可选**的媒体富化层（见 [`MEDIA_ENRICHMENT.md`](MEDIA_ENRICHMENT.md)）。
-> **默认关闭**：未启用时，本契约与 v1.0.x **完全一致**。一旦启用，以下三条语义发生变化：
+> 自 v1.2.0 起，本契约在保留 v1.1 基础的同时，为富化就绪的图片消息引入可选的结构化 `media` 字段及配套的媒体检索/获取端点：
 >
+> | # | 变更 | 核心语义与消费端指引 |
+> | :--- | :--- | :--- |
+> | 1 | **图片消息新增可选 `media` 对象** | 未就绪或未启用时字段完全不出现（不填 `null`）。内部包含 `asset_id`、`quality`、`format`、`width`、`height`、`bytes`、`path`、`url`、`anchor`、`source`、`ocr` 等结构化明细。 |
+> | 2 | **`text` 作为 OCR 文本的截断投影** | 当图片媒体富化就绪时，`text` 填入 `media.ocr.text` 的截断投影（≤2000 字符，超出加 `…`），以无缝兼容仅读取 `text` 的既有消费端；未就绪或无文字时保持空字符串。单一事实来源仍为 ledger 与 `media.ocr.text`。 |
+> | 3 | **`anchor` 定位与 `chat_name`** | 每条消息自带独立的 `anchor`（含 `chat_id`, `chat_name`, `local_id`, `ts`, `sender`），作为回到原会话的唯一凭据；`chat_name` 优先取解密备注名/群名，未命中则回退 `chat_id`。 |
+> | 4 | **单调游标与终态保证** | watermark 保持单调推进；仅未就绪且在等待窗口内的临时状态挂起水位，终态（ready/skipped/failed）绝不阻滞水位。 |
+> | 5 | **图片 `note` 状态细化** | 未就绪或跳过的图片消息按原因细化 `note`：`图片（处理中）`、`图片（未下载）`、`图片（动图）`、`图片（超大）`、`图片（不可解密）`、`图片（解析失败）`、`图片（无法定位）`；富化就绪或未启用时保持 `图片`。消费端可一眼区分无内容原因，绝不塞入错误详情或 OCR 文本。 |
+>
+> **消费端读取最佳实践**：
+> - 文本检索与智能体阅读：优先读取 `media.ocr.text`。
+> - 原图展示与归档存储：使用 `media.url` 发起携带 Bearer Token 的 GET 请求获取原图二进制。
+> - 对话定位与上下文回溯：依据 `media.anchor` 确定会话位置，或直接在 `/api/wechat/media` 检索时附带 `include=context` 参数。
+> - **即用检索命令**（按关键词检索图片并内联紧邻上下文）：
+>   ```bash
+>   curl -s -H "Authorization: Bearer <TOKEN>" "http://<HOST>:8765/api/wechat/media?q=发票&include=context&limit=10" | jq .
+>   ```
+>
+> ## ⚠️ v1.1 历史语义变更（语音与文件富化）
+>
+> 自 v1.1.0 起支持文件与语音富化：
 > | # | 变更 | 对消费端的要求 |
 > | :--- | :--- | :--- |
-> | 1 | **`text` 不再是"静态原文"**。媒体消息的 `text` 可能被填充（语音→转写文本；文件→原文 XML **追加**解析出的 Markdown） | **严禁把 `text` 用作去重键或缓存键**。同一消息的 `text` 会随解析完成而变化 |
-> | 2 | **`watermark` 不再严格单调**。若批次内含"尚未就绪"的媒体消息，服务端会把 `watermark` 回退到该消息之前，以便消费端复拉 | 消费端**必须**接受 `watermark` 回退，且**不得**假设 `新 watermark ≥ 旧 watermark`；幂等由 `manifest.sha256` + 稳定的消息标识保证 |
-> | 3 | 富化只作用于**白名单会话**，且可通过策略随时收窄 | 收窄白名单后，该会话的富化内容不再注入（`text` 退回基线形态） |
+> | 1 | **`text` 字段动态富化** | 语音填入转写文本；文件在原有 appmsg XML 之后**追加** Markdown 正文。严禁把 `text` 作为缓存或去重键。 |
+> | 2 | **`watermark` 回退机制** | 包含未就绪媒体时可能小幅回退以便复拉；消费端不可假定其物理单调递增。 |
+> | 3 | **白名单会话作用域** | 富化只在 `chat_allowlist` 内生效。 |
 >
 > **推荐的稳定消息标识**（不含 `text`）：
 > `MsgUID = SHA256(chat_id_or_name + "|" + ts + "|" + sender)`
->
-> 若你此前按 v1.0.x 的伪代码把 `text` 纳入了 `MsgUID`，**升级前必须改掉**，否则富化生效后同一消息会因 `text` 变化而产生新 UID，导致**重复入库**。
 > **适用范围**：`wx-pad-exporter` (安卓 Pad 守护进程) 及 Linux 家服 (`wechat-export-api`)  
 > **Schema 定义**：[`schema/export.schema.json`](../schema/export.schema.json)
 
@@ -97,6 +114,84 @@
 ```
 - **`status` 语义**：`red` = 硬故障（systemd 失败单元 / Clash 非 active / Docker 未全起 / GCP 不可达 / 磁盘 >90%）；`yellow` = 预警（磁盘 >80% / CPU >75°C / 可用内存 <1Gi / EdgeTunnel 可用节点 <30 / 资产或域名 30 天内到期）；其余 `green`。`alerts` 仅在非 `green` 时非空，每条为一句可读异常描述。
 
+#### (4) `GET /api/wechat/media`
+- **功能**：图片检索端点（支持按 OCR 文本、会话、时间、画质过滤，并按需内联上下文）。
+- **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`。
+- **安全边界**：**强制套用 blocklist**，被屏蔽的会话内容绝不出现在检索结果中。
+- **请求参数**：
+  | 参数名 | 类型 | 必填 | 默认值 | 说明与示例 |
+  | :--- | :--- | :--- | :--- | :--- |
+  | `q` | string | 否 | `""` | OCR 文本不区分大小写的子串匹配 |
+  | `chat_id` | string | 否 | `""` | 精确匹配会话 ID（如 `xxx@chatroom` 或 `wxid_xxx`） |
+  | `since` | string/int | 否 | `0` | 起始时间（支持 RFC3339 或 Epoch 秒） |
+  | `until` | string/int | 否 | 无穷大 | 截止时间（支持 RFC3339 或 Epoch 秒） |
+  | `quality` | string | 否 | `""` | 画质过滤：`hd` / `full` / `thumb` / `bubble` |
+  | `limit` | int | 否 | 20 | 单页大小（`include=context` 时最大保护性上限降为 50，其余模式最大 100） |
+  | `offset` | int | 否 | 0 | 分页偏移量 |
+  | `include` | string | 否 | `""` | 若传入 `context`，为每项内联消息前后的紧邻上下文 |
+- **上下文规则（`include=context`）**：
+  - 必须限制在同 `chat_id` 内，按 `local_id`/`ts` 获取紧邻的最多 2 条前序 (`before`) 和最多 2 条后序 (`after`) 消息。
+  - 上下文消息 `text` 超过 200 字符时截断并追加 `…`。
+  - 不含媒体字段以避免递归膨胀。
+- **响应体示例**：
+```json
+{
+  "items": [
+    {
+      "asset_id": "e4f6050b1f3c3a72b0c3d9a1e8f20b41",
+      "kind": "image",
+      "quality": "hd",
+      "format": "jpg",
+      "width": 1848,
+      "height": 4096,
+      "bytes": 2753317,
+      "path": "media/e4f6050b1f3c3a72b0c3d9a1e8f20b41/image.jpg",
+      "url": "/api/wechat/media/e4f6050b1f3c3a72b0c3d9a1e8f20b41/image.jpg",
+      "anchor": {
+        "chat_id": "23984719283@chatroom",
+        "chat_name": "技术研发交流群",
+        "local_id": 61,
+        "ts": 1759123456,
+        "sender": "wxid_sender123"
+      },
+      "source": {
+        "dat": "msg/attach/hash/2026-10/Img/e4f6050b1f3c3a72b0c3d9a1e8f20b41_h.dat",
+        "variant": "_h"
+      },
+      "ocr": {
+        "status": "ready",
+        "text": "测试发票开具明细...",
+        "provider": "rapidocr",
+        "lang": "chi_sim+eng",
+        "confidence": 0.93,
+        "version": 1,
+        "sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+      },
+      "context": {
+        "before": [
+          {"ts": "2026-10-13T07:44:00+08:00", "sender": "张三", "text": "发票我发出来了，大家核对一下"}
+        ],
+        "after": [
+          {"ts": "2026-10-13T07:46:12+08:00", "sender": "李四", "text": "收到，金额无误"}
+        ]
+      }
+    }
+  ],
+  "total": 1,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+#### (5) `GET /api/wechat/media/<asset_id>/<filename>`
+- **功能**：原图二进制文件下载。
+- **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`。
+- **安全防护**：
+  - 必须断言通过 `resolve()` 后的文件路径严格位于 `vault/media/` 目录下（403 阻断路径穿越）。
+  - `asset_id` 必须严格符合 `^[0-9a-f]{32}$`。
+  - `filename` 扩展名必须属于白名单（`jpg` / `jpeg` / `png` / `gif` / `webp`）。
+  - 若该资源所属会话全部被 `blocklist` 屏蔽，拒绝访问（返回 404）。
+- **缓存语义**：响应头返回 `ETag: "<sha256>"`，支持请求头 `If-None-Match` 返回 `304 Not Modified`。
 ---
 
 ## 3. 标准快照 Payload 规范 (Standard Snapshot Schema)
@@ -131,7 +226,38 @@
           "sender": "wxid_dev_bob",
           "kind": "image",
           "text": "",
-          "note": "图片"
+          "note": "图片",
+          "media": {
+            "asset_id": "e4f6050b1f3c3a72b0c3d9a1e8f20b41",
+            "kind": "image",
+            "quality": "hd",
+            "format": "jpg",
+            "width": 1848,
+            "height": 4096,
+            "bytes": 2753317,
+            "path": "media/e4f6050b1f3c3a72b0c3d9a1e8f20b41/image.jpg",
+            "url": "/api/wechat/media/e4f6050b1f3c3a72b0c3d9a1e8f20b41/image.jpg",
+            "anchor": {
+              "chat_id": "23984719283@chatroom",
+              "chat_name": "技术研发交流群",
+              "local_id": 61,
+              "ts": 1759123456,
+              "sender": "wxid_dev_bob"
+            },
+            "source": {
+              "dat": "msg/attach/hash/2026-10/Img/e4f6050b1f3c3a72b0c3d9a1e8f20b41_h.dat",
+              "variant": "_h"
+            },
+            "ocr": {
+              "status": "ready",
+              "text": "测试发票开具明细...",
+              "provider": "rapidocr",
+              "lang": "chi_sim+eng",
+              "confidence": 0.93,
+              "version": 1,
+              "sha256": "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+            }
+          }
         }
       ]
     },

@@ -15,8 +15,8 @@
 | :--- | :--- | :--- |
 | **文件附件**（pdf/docx/xlsx/pptx/html…） | MinerU 文档解析 | 是（MinerU；免 token 通道可用） |
 | **语音** | **微信客户端自带的语音转文字** | 否（纯读本地库） |
-| 图片 / 视频 | 不支持 | — |
-
+| **图片** | **离线 AES+XOR 解密 + 本地 OCR** | 否（100% 离线推导与计算） |
+| 视频 | 不支持（未评估） | — |
 ---
 
 ## 2. 架构
@@ -177,23 +177,30 @@ from collections import Counter;print(Counter(v['state'] for v in d['assets'].va
 
 ### `deny_reason` 速查
 
-| reason | 含义 | 处置 |
-| :--- | :--- | :--- |
-| `chat_not_allowlisted` | 会话不在白名单 | 加白名单 |
-| `ext_denied` / `ext_not_allowed` | 扩展名被 `skip_ext` / 白名单排除 | 调整 `file_ext_allow` |
-| `agent_unsupported` | 该格式 agent 通道不支持且无 token | 配 precise 凭据 |
-| `oversize` | 超过当前通道大小上限 | 拆分 / 配 precise |
-| `page_limit` | 超过页数上限且切片后仍失败 | 手动指定 `--pages` |
-| `missing_source` / `unresolved:*` | 消息有记录但磁盘无实体 / 无法唯一定位 | 微信可能从未下载该文件（点击才下载） |
-| `voice_not_transcribed` | 语音未转写且已过等待窗口 | 在客户端开启自动转写 / 手动转写 |
-| `no_credential` | 需要 precise 但未配 token | 见 §6 |
-| `deduped` | 同内容已解析过 | 正常，零成本 |
-
+| reason | 含义 | 处置 | 消费端 `note` |
+| :--- | :--- | :--- | :--- |
+| `chat_not_allowlisted` | 会话不在白名单 | 加白名单 | 原 `note`（图片/语音/文件） |
+| `ext_denied` / `ext_not_allowed` | 扩展名被 `skip_ext` / 白名单排除 | 调整 `file_ext_allow` | 原 `note` |
+| `agent_unsupported` | 该格式 agent 通道不支持且无 token | 配 precise 凭据 | 原 `note` |
+| `oversize` | 超过当前通道大小上限 | 拆分 / 配 precise | 原 `note` |
+| `page_limit` | 超过页数上限且切片后仍失败 | 手动指定 `--pages` | 原 `note` |
+| `missing_source` | 图片/文件从未落盘 | 微信只在点击/预览时下载，属正常现象 | `图片（未下载）` |
+| `image_not_on_disk` | 图片暂未落盘（pending 态） | 消息很新，等待窗口内自动复查，不阻滞水位推进 | `图片（处理中）` |
+| `unresolved:ambiguous` | 同名多档无法唯一定位 | 存在歧义，严格遵循「不猜」原则跳过 | `图片（无法定位）` |
+| `missing_keys` | kvcomm 推导与内存兜底均未获取密钥 | 检查 kvcomm 统计文件或开启 `allow_sudo_memscan`，需运维介入 | `图片（不可解密）` |
+| `skipped:decryptor_unavailable` | `wechat_image` 模块缺失或导入失败 | 检查环境依赖（如 pycryptodome）完整性 | `图片（不可解密）` |
+| `decrypt_failed` | dat 头损坏或密钥不匹配 | 可重试有限次，重试耗尽后落 failed 终态 | `图片（解析失败）` |
+| `max_pixels_exceeded` | 超过最大像素阈值（防解压炸弹） | 默认 5000 万像素，可调整 `image.max_pixels` | `图片（超大）` |
+| `skipped:animated` | wxgf 多帧动图 | 按策略 `wxgf.animated="skip"` 跳过 | `图片（动图）` |
+| `voice_not_transcribed` | 语音未转写且已过等待窗口 | 在客户端开启自动转写 / 手动转写 | `语音` |
+| `no_credential` | 需要 precise 但未配 token | 见 §6 | `卡片/链接/文件` |
+| `deduped` | 同内容已解析过 | 正常，零成本 | `图片` / 原 `note` |
 ---
 
 ## 8. 安全与隐私
 
 - **媒体内容会离开本机**（仅文件解析）：MinerU 是云端服务。白名单即"我同意把这些会话的内容送上去"的显式声明。
+- **图片解密与 OCR 全程本机**：密钥由本地 `kvcomm` 推导（或本地进程内存扫描），OCR 走本地引擎（RapidOCR/Tesseract），**不产生任何网络请求**；仅"文件附件解析"会调用 MinerU 云端。把会话移出白名单后，其图片不再被检索端点返回。
 - **语音转写不出本机**（走微信自身通道）。
 - 敏感类型可在 `file_ext_allow` 中直接排除。
 - 本层**不改变鉴权模型**：`/api/wechat/export` 始终要求 Bearer Token。
@@ -203,9 +210,9 @@ from collections import Counter;print(Counter(v['state'] for v in d['assets'].va
 
 ## 9. 已知限制
 
-| 限制 | 说明 |
+| 限制 / 现状 | 说明 |
 | :--- | :--- |
-| 图片（type 3）不支持 | 本地 `.dat` 为微信 4.x **V2 账号级 AES**；密钥不在内存（3.11GB/845 区域扫描 0 命中），消息 XML 的 per-image `aeskey` 只用于 CDN 下载，不能解本地 `.dat`。属独立课题 |
+| 图片（type 3）解密实测与支持 | 18,402/18,402 全部 V2 三段式、kvcomm 离线推导（AES-128-ECB + 单字节 XOR，xor_key=0x0C）、格式分布 jpg 80.65% / wxgf 11.75% / png 7.60%、画质可及性 hd 16.07% / full 29.42% / 仅缩略图 54.51%、明文 Thumb 兜底覆盖率仅 1.5%–11% 不可行。现已支持离线解密、变体择优（_h > full > _t > _b）与本地 OCR 富化，结构化附加至 `media` 字段，同时以 `text_head`（≤2000 字符截断投影）注入既有 `text` 字段以无缝兼容存量下游 |
 | 视频不支持 | 未评估 |
 | 历史语音不回溯 | 见 §5 |
 | 覆盖率受限于"微信是否已下载" | 文件是**点击才下载**；headless 客户端不会自动落盘所有附件，因此 `missing_source` 属正常现象 |

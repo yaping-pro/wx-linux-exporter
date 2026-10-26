@@ -1,0 +1,10 @@
+# Optional OCR dependencies for wx-linux-exporter (Local CPU inference)
+# Install via: pip install -r requirements-ocr.txt
+#
+# Primary engine: RapidOCR (ONNXRuntime CPU)
+# Provides deep-learning OCR (DBNet + SVTR/CRNN) for high accuracy on
+# Chinese, English, and mixed chat screenshots.
+rapidocr_onnxruntime>=1.2.3
+
+# Pillow for fast image dimension checking and format support
+Pillow>=10.0.0

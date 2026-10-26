@@ -148,11 +148,195 @@
         },
         "text": {
           "type": "string",
-          "description": "Plain text content, or raw XML payload for complex AppMsg cards. Baseline mode: media messages carry an empty string. v1.1 media-enrichment: voice messages carry the transcription and file messages carry the original XML with parsed Markdown appended. NOTE: text may change over time for the same message - never use it as a dedupe or cache key."
+          "description": "Plain text content, or raw XML payload for complex AppMsg cards. Baseline mode: media messages carry an empty string. v1.1 media-enrichment: voice messages carry the transcription and file messages carry the original XML with parsed Markdown appended. v1.2: image messages carry the truncated projection of media.ocr.text (<=2000 chars) when ready, otherwise empty string. NOTE: text may change over time for the same message - never use it as a dedupe or cache key."
         },
         "note": {
           "type": "string",
-          "description": "Human-readable auxiliary description of the message (e.g. '图片', '语音', '卡片/链接/文件')."
+          "description": "Human-readable auxiliary description of the message (e.g. '语音', '卡片/链接/文件'). For image messages: '图片' when media enrichment is ready or baseline, or fine-grained status notes when not ready ('图片（处理中）', '图片（未下载）', '图片（动图）', '图片（超大）', '图片（不可解密）', '图片（解析失败）', '图片（无法定位）')."
+        },
+        "media": {
+          "$ref": "#/$defs/mediaItem",
+          "description": "Optional media payload for enriched media messages (v1.2: images). Absent when media enrichment is disabled, media is not yet ready, or message has no media."
+        }
+      },
+      "additionalProperties": false
+    },
+    "mediaItem": {
+      "type": "object",
+      "required": [
+        "asset_id",
+        "kind",
+        "quality",
+        "format",
+        "width",
+        "height",
+        "bytes",
+        "path",
+        "url",
+        "anchor",
+        "source",
+        "ocr"
+      ],
+      "properties": {
+        "asset_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$",
+          "description": "Content-addressed MD5 hash of the decrypted image payload (stripped of _t/_h/_b suffix)."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "image"
+          ],
+          "description": "Media kind identifier."
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "hd",
+            "full",
+            "thumb",
+            "bubble"
+          ],
+          "description": "Observed image quality grade."
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "jpg",
+            "png",
+            "gif",
+            "webp"
+          ],
+          "description": "Normalized image file format."
+        },
+        "width": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Image width in pixels, if extractable."
+        },
+        "height": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Image height in pixels, if extractable."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Payload size in bytes."
+        },
+        "path": {
+          "type": "string",
+          "description": "Relative storage path under vault root (e.g. media/<asset_id>/image.<ext>)."
+        },
+        "url": {
+          "type": "string",
+          "description": "API retrieval URL path (e.g. /api/wechat/media/<asset_id>/image.<ext>)."
+        },
+        "anchor": {
+          "type": "object",
+          "required": [
+            "chat_id",
+            "chat_name",
+            "local_id",
+            "ts",
+            "sender"
+          ],
+          "properties": {
+            "chat_id": {
+              "type": "string",
+              "description": "Conversation identifier (e.g. xxx@chatroom or wxid_xxx)."
+            },
+            "chat_name": {
+              "type": "string",
+              "description": "Human-readable display name for the conversation, falling back to chat_id if unresolvable."
+            },
+            "local_id": {
+              "type": "integer",
+              "description": "Message local_id in the message shard table."
+            },
+            "ts": {
+              "type": "integer",
+              "description": "Message creation Unix epoch seconds."
+            },
+            "sender": {
+              "type": "string",
+              "description": "Sender identifier or display name."
+            }
+          },
+          "additionalProperties": false
+        },
+        "source": {
+          "type": "object",
+          "required": [
+            "dat",
+            "variant"
+          ],
+          "properties": {
+            "dat": {
+              "type": "string",
+              "description": "Relative source dat file path on disk."
+            },
+            "variant": {
+              "type": "string",
+              "description": "Selected variant indicator (_h, full, _t, _b)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "ocr": {
+          "type": "object",
+          "required": [
+            "status",
+            "text",
+            "provider",
+            "confidence"
+          ],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "ready",
+                "pending",
+                "skipped",
+                "failed",
+                "unavailable"
+              ],
+              "description": "OCR processing lifecycle status."
+            },
+            "text": {
+              "type": "string",
+              "description": "Recognized text content from image OCR."
+            },
+            "provider": {
+              "type": "string",
+              "description": "OCR engine provider name (rapidocr, tesseract, mineru, none)."
+            },
+            "lang": {
+              "type": "string",
+              "description": "Language code for OCR (e.g. chi_sim+eng)."
+            },
+            "confidence": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "Average OCR confidence score (0.0 to 1.0), or null if unsupported by engine."
+            },
+            "version": {
+              "type": "integer",
+              "description": "OCR schema version."
+            },
+            "sha256": {
+              "type": "string",
+              "description": "SHA-256 digest of decrypted plaintext image payload."
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

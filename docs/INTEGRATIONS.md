@@ -141,3 +141,139 @@ print('✅ Snapshot conforms strictly to export.schema.json')
 # 仅提取群聊名称和文本行，供智能体理解背景，降低 Token 消耗
 jq -r '.chats[] | select(.kind=="group") | "=== " + .name + " ===\n" + (.messages[] | select(.kind=="text") | .sender + ": " + .text)' /tmp/latest_slice.json
 ```
+
+---
+
+## 5. 方案四：Muse 消费端接入与验证 (Muse Consumption & Probing)
+
+微信 4.x 图片消息富化上线后，导出的图片消息携带结构化 `media` 对象及 OCR 文本。消费端既可零改动直接沿用旧接口，也可以深度透传图片元数据实现视觉多模态与会话定位。
+
+### 5.1 接入模式对比
+
+1. **零改动可用 (Zero-touch Compatibility)**：
+   - 消费端只需继续读取 `msg["text"]` 或 Webhook 载荷的 `content`。
+   - 若图片已完成 OCR，`text` 会直接包含 OCR 截断投影（≤2000 字符）；若无文字或未识别，`content` 仍回退为 `[图片]`。旧版早报与摘要管道完全不破坏。
+
+2. **建议改动 (Full Enriched Media Passthrough)**：
+   - 开启 `--include-media`（默认开启），Webhook 载荷中将包含：
+     - `media_url`：图片静态相对路径（如 `/api/wechat/media/<asset_id>/image.jpg`），消费端可按需拼上 Host 获取原图；
+     - `media_asset_id`：图片指纹，用于去重与缓存；
+     - `chat_name`：图片所在会话的可读名称（优先使用群聊备注/昵称，缺失时回退 `chat_id`）；
+     - `ocr_text`：完整的未截断 OCR 结果；
+     - `media`：完整的富化元数据对象（包含尺寸、格式、`anchor` 锚点和 `source` 来源）。
+
+> ⚠️ **核心原则：OCR 不等于视觉理解**  
+> 纯照片、风景、无文字插画的 `media.ocr.status` 为 `empty`（`ocr.text` 为空）。OCR 仅负责提取文本内容。如果业务端需要"看懂"照片（例如照片中有猫、在海边散步等），消费端必须取 `media.url` 投递给多模态大模型（如 GPT-4o / Claude Vision / Gemini Vision）进行图像解析，切勿误判为数据丢失。
+
+### 5.2 三步验证法 (Three-Step Verification)
+
+项目内置探针工具 `clients/muse_probe.py`（零第三方依赖，纯标准库），提供可重复的闭环验证：
+
+#### 第一步：数据层自检 (`--audit`)
+检查当前导出数据中图片消息的 OCR 状态与会话锚点（支持读取本地 JSON 或直接连导出端点）：
+
+```bash
+python3 clients/muse_probe.py --audit --input /tmp/wechat_export.json
+# 或直接打在线端点
+# python3 clients/muse_probe.py --audit --endpoint "http://127.0.0.1:8765/api/wechat/export" --token "${WECHAT_BEARER_TOKEN}"
+```
+
+**期望输出示例**：
+```text
+=== WeChat Image Media Enrichment Audit ===
+Total Image Messages Detected: 25
+
+Metric                               | Count    | Ratio     
+------------------------------------------------------------
+Total Images                         | 25       | 100.0%
+Text Non-empty                       | 23       | 92.0%
+Media Object Present                 | 25       | 100.0%
+Anchor Complete (5 fields)           | 25       | 100.0%
+Chat Name Resolved (!= chat_id)      | 22       | 88.0%
+
+OCR Status Distribution:
+  - empty          : 2      (8.0%)
+  - ready          : 23     (92.0%)
+
+Sample Images (up to 5, masked):
+#   | Chat Name            | Timestamp                | OCR Preview (≤80 chars)                 
+--------------------------------------------------------------------------------------------
+1   | 技术研发交流群       | 1759123456               | 解约协议与家庭医生签约通知全文...       
+2   | 社区医疗互助群       | 1759123480               | 门诊预约缴费凭证 手机号*** 经办人李四   
+
+AUDIT: PASS (text_rate=92.0%[>=80%], anchor=25/25[=100%], ocr_ready_empty=100.0%[>=90%])
+```
+
+#### 第二步：载荷预览 (`--dry-run`)
+在不发送任何网络请求、无需真实 Token 的情况下，预览探针将要构建的上下文与评测载荷：
+
+```bash
+python3 clients/muse_probe.py --dry-run --input /tmp/wechat_export.json --limit 1
+```
+
+**期望输出示例**：
+```text
+[DRY-RUN] Found 25 image messages. Showing up to 1 sample payloads:
+
+--- Payload Sample 1/1 (asset_id=3a7b9c...) ---
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "WeChat Message Context:\n```json\n{\n  \"kind\": \"image\",\n  \"media\": {\n    \"asset_id\": \"3a7b9c...\",\n    \"anchor\": {\n      \"chat_name\": \"技术研发交流群\"\n    }\n  }\n}\n```\n\nQuestion: 这张图里说了什么？前后在聊什么？\nPlease answer based strictly on the message context and its media enrichment information."
+    }
+  ],
+  "temperature": 0.0,
+  "max_tokens": 512
+}
+```
+
+#### 第三步：语义层打分 (`--score`)
+通过手写探针集 `probes.json`，把带图会话上下文投递到待测 AI 助手 Webhook，验证模型理解的准确度并严格防范幻觉：
+
+`probes.json` 配置示例：
+```json
+[
+  {
+    "asset_id": "3a7b9c1d2e3f4a5b6c7d8e9f0a1b2c3d",
+    "question": "这张图里说了什么？",
+    "must_contain": ["解约", "家庭医生"]
+  },
+  {
+    "asset_id": "8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+    "question": "这张图有文字吗？",
+    "must_contain": [],
+    "expect_empty": true
+  }
+]
+```
+
+运行评分命令：
+```bash
+python3 clients/muse_probe.py \
+  --score \
+  --input /tmp/wechat_export.json \
+  --expect probes.json \
+  --webhook-url "http://127.0.0.1:9000/webhook/wechat" \
+  --webhook-type "custom"
+```
+
+**期望输出示例**：
+```text
+=== Semantic Probe Score Summary ===
+Total Probes:       2
+Hit Rate:           100.0% (2/2)
+Hallucinations:     0
+Grounding Accuracy: 100.0%
+OVERALL:            PASS
+
+Details:
+--- Probe #1 [PASS] (asset=3a7b9c1d2e3f...) ---
+Question: 这张图里说了什么？
+Must Contain: ['解约', '家庭医生']
+Answer: 这是一张家庭医生解约协议的通知单...
+--- Probe #2 [PASS] (asset=8e9f0a1b2c3d...) ---
+Question: 这张图有文字吗？
+Expect Empty: True, Hallucination: False (ok)
+Answer: 图中是一张风景照片，没有检测到文字内容。
+```

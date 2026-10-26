@@ -7,8 +7,17 @@
 
 ## [Unreleased]
 ### Added
-- （待填）
-
+- **图片离线解密与 OCR 富化接入（契约 v1.2.0）**：
+  - `bin/wechat_media.py`：新增图片消息（`local_type=3`）解析流。通过 `hardlink.db`（`image_hardlink_info_v4`）与磁盘模式探测定位 `.dat` 变体，支持变体画质择优（`_h > full > _t > _b`）、wxgf 动图策略过滤、惰性解密器与本地 OCR 协同、防解压炸弹像素闸、双目录物化（`exports/media/<date>/<asset_id>/` 与 `vault/media/<asset_id>/`）以及基于内容哈希的跨会话幂等复用。
+  - `bin/wechat_export_api.py`：
+    - `GET /api/wechat/media`：图片检索端点，支持 OCR 文本模糊子串、会话 ID、时间范围与画质筛选；支持 `include=context` 获取紧邻前后各最多 2 条上下文（文本 200 字符截断，限额自动收紧至 50），严格套用 Bearer 鉴权与 `blocklist` 屏蔽会话隔离。
+    - `GET /api/wechat/media/<asset_id>/<filename>`：原图二进制下载端点，支持 `Content-Type` 自适应、ETag (sha256) 与 `If-None-Match` 304 缓存协商；路径严格限制在 `vault/media/` 目录下（403 阻断路径穿越），扩展名白名单校验，屏蔽会话资源防探测。
+    - `/api/wechat/export`：就绪图片消息附加可选 `media` 对象，`text` 字段填入 `media.ocr.text` 的截断投影（≤2000 字符，未就绪保持空串），无缝兼容仅读取 `text` 的既有消费端；`anchor` 附带 `chat_name` 与原始会话坐标。
+  - `schema/export.schema.json`：新增严格定义的 `mediaItem` 与 `anchor` Schema（`additionalProperties: false`），保持向后兼容。
+  - `docs/DATA_CONTRACT.md`：新增 v1.2.0 契约章节、检索与原图端点规范、上下文抽取说明与消费端读取指引。
+  - `docs/MEDIA_ENRICHMENT.md`：更正第 9 节结论为实机验证事实（18,402 个文件 100% 离线 V2 可解），更新架构与能力边界。
+  - `config/media_policy.example.json`：新增 `image` 段配置模板（默认关闭）。
+  - `tests/test_media_images.py`：综合测试套件，全面覆盖画质择优、asset_id 跨群去重复用、anchor 精准定位、OCR 三态降级、wxgf 动图跳过、blocklist 全端点拦截、路径穿越防御、304 协商缓存、Schema 严格性、上下文无串味抽取与截断、`chat_name` 智能解析与回退。
 ---
 
 ## [v1.1.1] - 2026-10-16

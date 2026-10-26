@@ -149,6 +149,14 @@ DEFAULT_POLICY_BODY = {
     "enabled": False,
     "chat_allowlist": [],
     "kinds": {"file": True, "image": False, "voice": True, "video": False},
+    "image": {
+        "enabled": False,
+        "quality_preference": ["hd", "full", "thumb", "bubble"],
+        "max_pixels": 50_000_000,
+        "allow_sudo_memscan": False,
+        "wxgf": {"animated": "skip"},
+        "ocr": {"enabled": True, "providers": ["rapidocr", "tesseract"], "timeout": 60},
+    },
     "file_ext_allow": ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt",
                        "html", "htm", "md", "txt", "csv"],
     "skip_ext": ["zip", "rar", "7z", "gz", "svg", "m4a", "mp3", "mp4"],
@@ -190,11 +198,12 @@ def load_ledger(path: Path) -> dict:
             if isinstance(d, dict):
                 d.setdefault("assets", {})
                 d.setdefault("by_message", {})
+                d.setdefault("anchors", {})
                 d.setdefault("daily", {})
                 return d
         except Exception as e:  # noqa: BLE001
             log(f"[WARN] ledger 解析失败，另起新账本：{e}")
-    return {"version": 1, "watermark": 0, "assets": {}, "by_message": {}, "daily": {}}
+    return {"version": 1, "watermark": 0, "assets": {}, "by_message": {}, "anchors": {}, "daily": {}}
 
 
 def save_json_atomic(path: Path, obj: dict) -> None:
@@ -250,10 +259,14 @@ def load_hardlink(decrypted: Path) -> tuple[dict[int, str], dict[str, tuple]]:
     try:
         dir2id = {r[0]: r[1] for r in con.execute("SELECT rowid, username FROM dir2id")}
         files = {}
-        for md5, fn, d1, d2, size in con.execute(
-            "SELECT md5, file_name, dir1, dir2, file_size FROM file_hardlink_info_v4"
-        ):
-            files[str(md5)] = (str(fn), d1, d2, int(size or 0))
+        cursor = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_hardlink_info_v4'"
+        )
+        if cursor.fetchone():
+            for md5, fn, d1, d2, size in con.execute(
+                "SELECT md5, file_name, dir1, dir2, file_size FROM file_hardlink_info_v4"
+            ):
+                files[str(md5)] = (str(fn), d1, d2, int(size or 0))
         return dir2id, files
     finally:
         con.close()
@@ -447,6 +460,273 @@ def iter_voice_messages(decrypted: Path, allow_md5: set[str], since: int):
             con.close()
 
 
+def clean_asset_id(raw_name: str) -> str:
+    """去除 _t / _h / _b 后缀及扩展名，获取规范的 32 位十六进制 asset_id。"""
+    stem = Path(raw_name).stem.lower()
+    base = re.sub(r"_[thb]$", "", stem)
+    return base
+
+
+def variant_of_path(path: Path) -> str:
+    stem = path.stem.lower()
+    if stem.endswith("_h"):
+        return "_h"
+    elif stem.endswith("_t"):
+        return "_t"
+    elif stem.endswith("_b"):
+        return "_b"
+    return ""
+
+
+def quality_of_path(path: Path) -> str:
+    try:
+        import wechat_image
+        return wechat_image.quality_of(path)
+    except (ImportError, AttributeError):
+        stem = path.stem.lower()
+        if stem.endswith("_h"):
+            return "hd"
+        elif stem.endswith("_t"):
+            return "thumb"
+        elif stem.endswith("_b"):
+            return "bubble"
+        return "full"
+
+
+def rank_image_variants(paths: list[Path]) -> list[Path]:
+    try:
+        import wechat_image
+        return wechat_image.rank_variants(paths)
+    except (ImportError, AttributeError):
+        def _score(p: Path) -> int:
+            s = p.stem.lower()
+            if s.endswith("_h"):
+                return 4
+            elif s.endswith("_t"):
+                return 2
+            elif s.endswith("_b"):
+                return 1
+            return 3  # full (no suffix)
+
+        return sorted(paths, key=_score, reverse=True)
+
+
+def resolve_chat_name(chat_id: str, target: Path) -> str:
+    decrypted = resolve_decrypted(target) if (target / "decrypted").is_dir() else target
+    contact_path = decrypted / "contact" / "contact.db"
+    if contact_path.is_file():
+        try:
+            uri = f"file:{contact_path.resolve()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                cursor = con.execute("PRAGMA table_info(contact)")
+                cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
+                u_col = cols.get("username", "username")
+                r_col = cols.get("remark", "remark")
+                n_col = cols.get("nick_name", cols.get("nickname", "nick_name"))
+                a_col = cols.get("alias", "alias")
+                query = f"SELECT {r_col}, {n_col}, {a_col} FROM contact WHERE {u_col} = ?"
+                row = con.execute(query, (chat_id,)).fetchone()
+                if row:
+                    remark = str(row[0] or "").strip()
+                    nick = str(row[1] or "").strip()
+                    alias = str(row[2] or "").strip()
+                    display = remark or nick or alias
+                    if display:
+                        return display
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    session_path = decrypted / "session" / "session.db"
+    if session_path.is_file():
+        try:
+            uri = f"file:{session_path.resolve()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                cursor = con.execute("PRAGMA table_info(SessionTable)")
+                cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
+                if "username" in cols:
+                    u_col = cols["username"]
+                    d_col = (
+                        cols.get("display_name")
+                        or cols.get("remark")
+                        or cols.get("nick_name")
+                    )
+                    if d_col:
+                        query = f"SELECT {d_col} FROM SessionTable WHERE {u_col} = ?"
+                        row = con.execute(query, (chat_id,)).fetchone()
+                        if row and str(row[0] or "").strip():
+                            return str(row[0]).strip()
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    return chat_id
+
+
+def load_image_hardlink(decrypted: Path) -> tuple[dict[int, str], dict[str, tuple]]:
+    hl = decrypted / "hardlink" / "hardlink.db"
+    if not hl.is_file():
+        return {}, {}
+    con = sqlite3.connect(f"file:{hl}?mode=ro&immutable=1", uri=True)
+    try:
+        dir2id: dict[int, str] = {}
+        try:
+            dir2id = {r[0]: r[1] for r in con.execute("SELECT rowid, username FROM dir2id")}
+        except sqlite3.Error:
+            pass
+        images: dict[str, tuple] = {}
+        try:
+            cursor = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='image_hardlink_info_v4'"
+            )
+            if cursor.fetchone():
+                for md5, fn, d1, d2 in con.execute(
+                    "SELECT md5, file_name, dir1, dir2 FROM image_hardlink_info_v4"
+                ):
+                    images[str(md5).lower()] = (str(fn), d1, d2)
+        except sqlite3.Error:
+            pass
+        return dir2id, images
+    finally:
+        con.close()
+
+
+def find_image_dat(
+    attach_root: Path | None,
+    cache_root: Path | None,
+    chat_md5: str,
+    month: str | None,
+    asset_id: str,
+) -> tuple[list[Path], str]:
+    """寻找与 asset_id 匹配的所有变体 .dat 文件。"""
+    candidates: list[Path] = []
+    if month and re.fullmatch(r"\d{4}-\d{2}", month):
+        if attach_root:
+            img_dir = attach_root / chat_md5 / month / "Img"
+            if img_dir.is_dir():
+                for suffix in ("_h.dat", ".dat", "_t.dat"):
+                    p = img_dir / f"{asset_id}{suffix}"
+                    if p.is_file():
+                        candidates.append(p)
+        if cache_root:
+            bubble_file = cache_root / month / "Message" / chat_md5 / "Bubble" / f"{asset_id}_b.dat"
+            if bubble_file.is_file():
+                candidates.append(bubble_file)
+        if candidates:
+            return candidates, "hardlink:month"
+
+    found_by_month: dict[str, list[Path]] = {}
+    if attach_root and (attach_root / chat_md5).is_dir():
+        for month_dir in (attach_root / chat_md5).iterdir():
+            if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                img_dir = month_dir / "Img"
+                if img_dir.is_dir():
+                    for suffix in ("_h.dat", ".dat", "_t.dat"):
+                        p = img_dir / f"{asset_id}{suffix}"
+                        if p.is_file():
+                            found_by_month.setdefault(month_dir.name, []).append(p)
+
+    if cache_root and cache_root.is_dir():
+        for month_dir in cache_root.iterdir():
+            if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                bubble_file = month_dir / "Message" / chat_md5 / "Bubble" / f"{asset_id}_b.dat"
+                if bubble_file.is_file():
+                    found_by_month.setdefault(month_dir.name, []).append(bubble_file)
+
+    if not found_by_month:
+        # 兜底：转发图片可能保存在最初接收该文件的其他会话目录下
+        if attach_root and attach_root.is_dir():
+            for c_dir in attach_root.iterdir():
+                if c_dir.is_dir() and c_dir.name != chat_md5:
+                    for month_dir in c_dir.iterdir():
+                        if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                            img_dir = month_dir / "Img"
+                            if img_dir.is_dir():
+                                for suffix in ("_h.dat", ".dat", "_t.dat"):
+                                    p = img_dir / f"{asset_id}{suffix}"
+                                    if p.is_file():
+                                        found_by_month.setdefault(month_dir.name, []).append(p)
+
+    if not found_by_month:
+        return [], "unresolved:not_found"
+    if len(found_by_month) > 1:
+        return [], "unresolved:ambiguous_month"
+    single_month = next(iter(found_by_month.keys()))
+    return found_by_month[single_month], f"probe:{single_month}"
+
+
+def iter_image_messages(decrypted: Path, allow_md5: set[str], since: int):
+    """产出 (chat_id, local_id, create_time, sender, img_info)——仅图片消息。"""
+    shards = sorted(p for p in (decrypted / "message").glob("*.db")
+                    if re.fullmatch(r"(message|biz_message)_\d+\.db", p.name))
+    for shard in shards:
+        con = sqlite3.connect(f"file:{shard}?mode=ro&immutable=1", uri=True)
+        try:
+            chat_by_table: dict[str, str] = {}
+            n2id: dict[int, str] = {}
+            try:
+                for rid, uname in con.execute("SELECT rowid, user_name FROM Name2Id"):
+                    if not uname:
+                        continue
+                    uname_str = str(uname)
+                    n2id[int(rid)] = uname_str
+                    h = hashlib.md5(uname_str.encode()).hexdigest()
+                    if h in allow_md5:
+                        chat_by_table[h] = uname_str
+            except sqlite3.Error:
+                pass
+
+            for tbl, in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ):
+                chat = chat_by_table.get(tbl[4:])
+                if not chat:
+                    continue
+                is_group = chat.endswith("@chatroom")
+                q = (f"SELECT local_id, real_sender_id, create_time, message_content, compress_content "
+                     f"FROM [{tbl}] WHERE (local_type & 0xFFFFFFFF) = 3 AND create_time >= ? "
+                     f"ORDER BY create_time DESC")
+                for lid, rsid, ct, mc, cc in con.execute(q, (since,)):
+                    text = decompress(mc) or decompress(cc)
+                    sender = "我"
+                    if is_group:
+                        match_sender = re.match(r"^([a-zA-Z0-9_\-]+):\n", text)
+                        if match_sender:
+                            sender = match_sender.group(1)
+                        elif rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                    else:
+                        if rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                        elif rsid == 0:
+                            sender = "我"
+                        else:
+                            sender = chat
+
+                    m_md5 = (
+                        re.search(r'md5=["\']([0-9a-fA-F]{32}(?:_[thb])?)["\']', text)
+                        or re.search(r'<md5>([0-9a-fA-F]{32}(?:_[thb])?)</md5>', text)
+                    )
+                    m_len = (
+                        re.search(r'length=["\'](\d+)["\']', text)
+                        or re.search(r'<totallen>(\d+)</totallen>', text)
+                    )
+                    m_aes = re.search(r'aeskey=["\']([^"\']+)["\']', text)
+                    img_info = {
+                        "md5": (m_md5.group(1).lower() if m_md5 else ""),
+                        "length": int(m_len.group(1)) if m_len else 0,
+                        "aeskey": (m_aes.group(1) if m_aes else ""),
+                        "raw_xml": text,
+                    }
+                    yield chat, int(lid), int(ct), sender, img_info
+        finally:
+            con.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="WeChat 媒体解析 worker")
     ap.add_argument("--policy", default=str(DEFAULT_POLICY))
@@ -473,8 +753,8 @@ def main() -> int:
         log("[INFO] chat_allowlist 为空 = 媒体全关，无事可做。")
         return 0
     kinds = policy.get("kinds") or {}
-    if not (kinds.get("file") or kinds.get("voice")):
-        log("[INFO] kinds.file 与 kinds.voice 均关闭，无事可做。")
+    if not (kinds.get("file") or kinds.get("voice") or kinds.get("image")):
+        log("[INFO] kinds.file、kinds.voice 与 kinds.image 均关闭，无事可做。")
         return 0
 
     lock_path = vault / "state" / "media.lock"
@@ -485,10 +765,10 @@ def main() -> int:
     except BlockingIOError:
         log("[INFO] 已有 worker 在运行，跳过本轮。")
         return 0
-
     decrypted = resolve_decrypted(vault)
     if not (decrypted / "message").is_dir():
         log(f"[ERROR] 解密库不可用：{decrypted}")
+        lock_fh.close()
         return 1
 
     ledger_path = vault / "state" / "media_ledger.json"
@@ -508,11 +788,27 @@ def main() -> int:
     max_chars = int(render_cfg.get("max_chars_per_doc") or 4000)
 
     files_root = discover_wechat_files_root(policy.get("wechat_files_glob") or DEFAULT_WECHAT_GLOB)
-    if not files_root:
+    if not files_root and kinds.get("file"):
         log("[ERROR] 未找到微信接收文件目录（msg/file）。")
         return 1
-    log(f"[INFO] files_root={files_root}  vault={vault}  allow={allow}")
 
+    account_dir = (
+        Path(policy["wechat_account_dir"]).expanduser()
+        if policy.get("wechat_account_dir")
+        else (files_root.parent.parent if files_root else None)
+    )
+    attach_root = (
+        Path(policy["wechat_attach_root"]).expanduser()
+        if policy.get("wechat_attach_root")
+        else ((account_dir / "msg" / "attach") if account_dir else None)
+    )
+    cache_root = (
+        Path(policy["wechat_cache_root"]).expanduser()
+        if policy.get("wechat_cache_root")
+        else ((account_dir / "cache") if account_dir else None)
+    )
+    wxid = policy.get("wxid") or (account_dir.name if account_dir else "")
+    log(f"[INFO] files_root={files_root}  attach_root={attach_root}  vault={vault}  allow={allow}")
     dir2id, hl_files = load_hardlink(decrypted)
     allow_md5 = {hashlib.md5(c.encode()).hexdigest() for c in allow}
 
@@ -761,11 +1057,334 @@ def main() -> int:
         summary["voice_skipped"] = v_skipped
         log(f"[VOICE] ready={v_ready} pending={v_pending} skipped={v_skipped}")
 
+    # ── 图片：离线 V2 AES+XOR 解密 + 变体择优 + 本地 OCR ──────────────────
+    if kinds.get("image"):
+        img_cfg = policy.get("image") or {}
+        max_pixels = int(img_cfg.get("max_pixels") or 50_000_000)
+        wxgf_cfg = img_cfg.get("wxgf") or {}
+        wxgf_animated = wxgf_cfg.get("animated", "skip")
+        ocr_cfg = img_cfg.get("ocr") or {}
+        ocr_enabled = bool(ocr_cfg.get("enabled", True))
+        ocr_providers = tuple(ocr_cfg.get("providers", ["rapidocr", "tesseract"]))
+        ocr_timeout = int(ocr_cfg.get("timeout", 60))
+        img_pending_window = int((policy.get("readiness") or {}).get("max_pending_age_s") or 1800)
+        img_max_retries = int((policy.get("readiness") or {}).get("max_parse_retries") or 2)
+
+        dir2id_img, hl_images = load_image_hardlink(decrypted)
+
+        try:
+            import wechat_image
+        except ImportError:
+            wechat_image = None
+
+        image_keys = None
+        if wechat_image and account_dir:
+            try:
+                image_keys = wechat_image.resolve_keys(
+                    account_dir,
+                    wxid,
+                    templates=None,
+                    allow_sudo=bool(img_cfg.get("allow_sudo_memscan", False)),
+                    cache_path=vault / "state" / "image_keys.json",
+                )
+            except Exception as e:  # noqa: BLE001
+                log(f"[WARN] resolve_keys 失败: {type(e).__name__}: {e}")
+
+        now_ts = time.time()
+        for chat, lid, ct, sender, img_info in iter_image_messages(decrypted, allow_md5, since):
+            if processed >= max_items:
+                log("[INFO] 达到本轮 max_items 上限，收工。")
+                break
+            if daily["parsed"] >= budget:
+                log("[INFO] 今日预算用尽，收工。")
+                break
+
+            key = f"{chat}|{lid}"
+            raw_md5 = img_info.get("md5", "")
+            if not raw_md5:
+                mark(key, None, ct)
+                summary["skipped"] += 1
+                continue
+
+            asset_id = clean_asset_id(raw_md5)
+            chat_name = resolve_chat_name(chat, vault)
+            anchor = {
+                "chat_id": chat,
+                "chat_name": chat_name,
+                "local_id": lid,
+                "ts": ct,
+                "sender": sender,
+            }
+
+            existing = ledger["assets"].get(asset_id)
+            if existing and existing.get("state") in (STATE_READY, STATE_SKIPPED, STATE_FAILED):
+                if existing.get("state") == STATE_READY and "text_head" not in existing:
+                    ocr_info = existing.get("ocr") or {}
+                    if ocr_info.get("status") == "ready" and ocr_info.get("text"):
+                        raw_ocr = str(ocr_info["text"]).strip()
+                        existing["text_head"] = (raw_ocr[:2000] + "…") if len(raw_ocr) > 2000 else raw_ocr
+                    else:
+                        existing["text_head"] = ""
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            if existing and existing.get("state") == STATE_PENDING:
+                attempts = int(existing.get("attempts") or 0)
+                if attempts >= img_max_retries:
+                    existing["state"] = STATE_FAILED
+                    existing["deny_reason"] = "retries_exhausted"
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["failed"] += 1
+                    continue
+
+            hl_entry = hl_images.get(asset_id) or hl_images.get(raw_md5)
+            month = None
+            disk_asset_id = asset_id
+            if hl_entry:
+                disk_asset_id = clean_asset_id(hl_entry[0])
+                month = dir2id_img.get(hl_entry[1]) or dir2id_img.get(hl_entry[2])
+
+            chat_hash = hashlib.md5(chat.encode("utf-8")).hexdigest()
+            candidates, how = find_image_dat(attach_root, cache_root, chat_hash, month, disk_asset_id)
+            if not candidates and disk_asset_id != asset_id:
+                candidates, how = find_image_dat(attach_root, cache_root, chat_hash, month, asset_id)
+            asset_id = disk_asset_id
+
+            existing = ledger["assets"].get(asset_id)
+            if existing and existing.get("state") in (STATE_READY, STATE_SKIPPED, STATE_FAILED):
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+            if not candidates:
+                if how.startswith("unresolved:ambiguous"):
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                        "deny_reason": how, "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["unresolved"] += 1
+                    continue
+
+                if now_ts - ct < img_pending_window:
+                    prev_att = int((existing or {}).get("attempts") or 0)
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_PENDING,
+                        "deny_reason": "image_not_on_disk", "attempts": prev_att + 1,
+                        "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    ledger["by_message"].setdefault(key, asset_id)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    continue
+                else:
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                        "deny_reason": "missing_source", "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["skipped"] += 1
+                    continue
+
+            ranked = rank_image_variants(candidates)
+            best_dat = ranked[0]
+            quality = quality_of_path(best_dat)
+            variant = variant_of_path(best_dat)
+            rel_dat_str = (
+                str(best_dat.relative_to(account_dir))
+                if (account_dir and best_dat.is_relative_to(account_dir))
+                else str(best_dat)
+            )
+
+            if args.dry_run:
+                log(f"[DRY] Image {chat} lid={lid} {asset_id} {best_dat.name} ({how}, {quality})")
+                processed += 1
+                continue
+
+            if not wechat_image:
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "skipped:decryptor_unavailable", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            if not image_keys:
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "missing_keys", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            dec = wechat_image.decrypt_dat(best_dat, image_keys)
+            if not dec or not dec.data:
+                prev_att = int((existing or {}).get("attempts") or 0)
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_FAILED,
+                    "deny_reason": "decrypt_failed", "attempts": prev_att + 1,
+                    "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["failed"] += 1
+                continue
+
+            width = dec.width
+            height = dec.height
+            if width and height and (width * height > max_pixels):
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "max_pixels_exceeded", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            final_data = dec.data
+            final_fmt = (dec.fmt or "jpg").lower()
+            if final_fmt == "wxgf":
+                staging_png = staging_root / f"{asset_id}.png"
+                staging_png.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    ok, is_anim = wechat_image.convert_wxgf(dec.data, staging_png, animated=wxgf_animated)
+                    if is_anim and wxgf_animated == "skip":
+                        rec = {
+                            "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                            "deny_reason": "skipped:animated", "anchor": anchor, "create_time": ct,
+                        }
+                        ledger["assets"][asset_id] = rec
+                        mark(key, asset_id, ct)
+                        ledger.setdefault("anchors", {})[key] = anchor
+                        summary["skipped"] += 1
+                        continue
+                    if not ok or not staging_png.is_file():
+                        rec = {
+                            "asset_id": asset_id, "kind": "image", "state": STATE_FAILED,
+                            "deny_reason": "wxgf_convert_failed", "anchor": anchor, "create_time": ct,
+                        }
+                        ledger["assets"][asset_id] = rec
+                        mark(key, asset_id, ct)
+                        ledger.setdefault("anchors", {})[key] = anchor
+                        summary["failed"] += 1
+                        continue
+                    final_data = staging_png.read_bytes()
+                    final_fmt = "png"
+                finally:
+                    if staging_png.exists():
+                        staging_png.unlink()
+
+            sha256_hex = hashlib.sha256(final_data).hexdigest()
+            ocr_record = {
+                "status": "skipped",
+                "text": "",
+                "provider": "none",
+                "lang": "",
+                "confidence": None,
+                "version": 1,
+                "sha256": sha256_hex,
+            }
+            if ocr_enabled:
+                try:
+                    import wechat_ocr
+                except ImportError:
+                    wechat_ocr = None
+
+                if not wechat_ocr:
+                    ocr_record["status"] = "unavailable"
+                else:
+                    try:
+                        ores = wechat_ocr.ocr_image(final_data, providers=ocr_providers, timeout=ocr_timeout)
+                        ocr_record = {
+                            "status": ores.status,
+                            "text": ores.text,
+                            "provider": ores.provider,
+                            "lang": ores.lang,
+                            "confidence": ores.confidence,
+                            "version": 1,
+                            "sha256": sha256_hex,
+                        }
+                    except Exception as e:  # noqa: BLE001
+                        ocr_record = {
+                            "status": "failed",
+                            "text": "",
+                            "provider": "none",
+                            "lang": "",
+                            "confidence": None,
+                            "version": 1,
+                            "sha256": sha256_hex,
+                            "error": str(e)[:200],
+                        }
+
+            date_dir = out_root / today / asset_id
+            date_dir.mkdir(parents=True, exist_ok=True)
+            export_file = date_dir / f"image.{final_fmt}"
+            export_file.write_bytes(final_data)
+
+            vault_media_dir = vault / "media" / asset_id
+            vault_media_dir.mkdir(parents=True, exist_ok=True)
+            vault_media_file = vault_media_dir / f"image.{final_fmt}"
+            if not vault_media_file.exists():
+                try:
+                    os.link(export_file, vault_media_file)
+                except OSError:
+                    shutil.copy2(export_file, vault_media_file)
+            if ocr_record.get("status") == "ready" and ocr_record.get("text"):
+                raw_ocr = str(ocr_record["text"]).strip()
+                text_head = (raw_ocr[:2000] + "…") if len(raw_ocr) > 2000 else raw_ocr
+            else:
+                text_head = ""
+
+            rec = {
+                "asset_id": asset_id,
+                "kind": "image",
+                "quality": getattr(dec, "quality", None) or quality,
+                "format": final_fmt,
+                "width": width,
+                "height": height,
+                "bytes": len(final_data),
+                "sha256": sha256_hex,
+                "text_head": text_head,
+                "path": f"media/{asset_id}/image.{final_fmt}",
+                "url": f"/api/wechat/media/{asset_id}/image.{final_fmt}",
+                "anchor": anchor,
+                "source": {"dat": rel_dat_str, "variant": variant},
+                "ocr": ocr_record,
+                "state": STATE_READY,
+                "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+            }
+            ledger["assets"][asset_id] = rec
+            mark(key, asset_id, ct)
+            ledger.setdefault("anchors", {})[key] = anchor
+            daily["parsed"] += 1
+            daily["bytes"] += len(final_data)
+            summary["ready"] += 1
+            processed += 1
+            log(f"[OK] Image {chat} lid={lid} {asset_id} -> {export_file} "
+                f"({len(final_data)}B, ocr={ocr_record['status']})")
+
     ledger["watermark"] = max(int(ledger.get("watermark") or 0), settled_max)
     ledger["updated_at"] = datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
     if not args.dry_run:
         save_json_atomic(ledger_path, ledger)
     log(f"[DONE] {summary} daily={daily} watermark={ledger['watermark']}")
+    lock_fh.close()
     return 0
 
 
