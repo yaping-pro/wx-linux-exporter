@@ -44,6 +44,12 @@ except ImportError:
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
+# 家服巡检简报快照：由 /home/steven/.agents/scripts/generate-report.py 每日
+# 09:00 生成简报时原子写入，本服务只读转发（不触发采集、不修改简报）。
+DEFAULT_BRIEFING_PATH = os.environ.get(
+    "HOMELAB_BRIEFING_PATH", "/var/lib/homelab-inspector/briefing.json"
+)
+
 # ── 媒体富化（可选，默认关闭）──────────────────────────────────────────────────
 # 设计原则：不新增响应字段、不新增端点、不改任何既有键名。
 # 富化结果只做两件事：
@@ -550,6 +556,25 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "ok"})
             return
 
+        if path == "/api/health/briefing":
+            # 与导出接口同一套 Bearer 鉴权：简报含主机健康明细，绝不匿名暴露。
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            briefing_path = Path(
+                self.server_context.get("briefing_path") or DEFAULT_BRIEFING_PATH
+            ).expanduser()
+            try:
+                with open(briefing_path, "r", encoding="utf-8") as f:
+                    briefing = json.load(f)
+                self.send_json(200, briefing)
+            except FileNotFoundError:
+                self.send_json(503, {"error": "Briefing snapshot not available yet"})
+            except (OSError, ValueError) as e:
+                self.send_json(500, {"error": f"Failed to read briefing snapshot: {e}"})
+            return
+
         if path == "/api/wechat/export":
             if not self.check_auth():
                 self.send_json(401, {"error": "Unauthorized"})
@@ -594,6 +619,7 @@ def create_server(
     auth_enabled: bool = True,
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
+    briefing_path: str | None = None,
 ) -> HTTPServer:
     """Creates an HTTPServer instance with configured server context."""
     server_context = {
@@ -602,6 +628,7 @@ def create_server(
         "auth_enabled": auth_enabled,
         "allowlist": allowlist or [],
         "blocklist": blocklist or [],
+        "briefing_path": briefing_path or DEFAULT_BRIEFING_PATH,
     }
     try:
         from http.server import ThreadingHTTPServer

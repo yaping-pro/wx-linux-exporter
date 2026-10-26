@@ -71,6 +71,32 @@
   | `to` | string/int | 否 | `now` (请求发起时刻) | 结束时间戳。支持 RFC3339 或 Unix Epoch 秒 |
   | `limit` | int | 否 | 500 (手机端可按需配置) | 保护性单次返回上限 |
 
+#### (3) `GET /api/health/briefing`
+- **功能**：返回家服每日巡检简报快照（`linux1` 09:00 生成、同时推送 Telegram/飞书的那份原文 + 结构化健康指标），供 AI 助手每日拉取监测。
+- **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`（与 `/api/wechat/export` 完全一致）。该端点不匿名开放。
+- **数据来源**：只读 `/var/lib/homelab-inspector/briefing.json`（由 `generate-report.py` 在渲染简报时原子写入，可用 `HOMELAB_BRIEFING_PATH` 覆盖）。**不触发采集、不改写内容**；快照缺失时返回 `503`。
+- **响应体**：
+```json
+{
+  "generated_at": "2026-10-17T09:01:02+08:00",
+  "host": "linux1",
+  "status": "green",
+  "markdown": "🟢 【家服巡检简报】全绿健康\n…",
+  "metrics": {
+    "load_1": 0.2, "load_5": 0.31, "load_15": 0.29,
+    "memory_used_bytes": 4939212390, "memory_total_bytes": 13958643712,
+    "memory_available_bytes": 9126805504,
+    "disk_used_pct": 35, "cpu_temp_c": 49.5,
+    "docker_running": 16, "docker_total": 16,
+    "systemd_failed": 0, "clash_active": true,
+    "edgetunnel_available_nodes": 64, "gcp_reachable": true,
+    "nearest_asset_days_left": 89, "nearest_asset_name": "…"
+  },
+  "alerts": []
+}
+```
+- **`status` 语义**：`red` = 硬故障（systemd 失败单元 / Clash 非 active / Docker 未全起 / GCP 不可达 / 磁盘 >90%）；`yellow` = 预警（磁盘 >80% / CPU >75°C / 可用内存 <1Gi / EdgeTunnel 可用节点 <30 / 资产或域名 30 天内到期）；其余 `green`。`alerts` 仅在非 `green` 时非空，每条为一句可读异常描述。
+
 ---
 
 ## 3. 标准快照 Payload 规范 (Standard Snapshot Schema)
