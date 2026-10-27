@@ -31,8 +31,11 @@ services:
       - "--token"
       - "${WECHAT_TOKEN:?WECHAT_TOKEN environment variable must be explicitly set}"
     volumes:
-      # Read-only mounts for decrypted vault and configuration (prevents data corruption)
-      - "${WECHAT_VAULT_HOST_DIR:-~/.local/share/wechat-vault}:/vault:ro"
+      # 只读输入与媒体查询：解密快照 + 策略配置 + 账本 + 物化媒体目录
+      - "${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}/decrypted:/vault/decrypted:ro"
+      - "${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}/config:/vault/config:ro"
+      - "${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}/state:/vault/state:ro"
+      - "${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}/media:/vault/media:ro"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8765/health"]
       interval: 30s
@@ -65,10 +68,16 @@ services:
       - >
         while true; do
           echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Running wxmedia sync...";
-          wxmedia --policy /vault/config/media_policy.json --vault /vault || true;
-          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Sleeping 300s before next iteration...";
+          wxmedia --policy /vault/config/media_policy.json --vault /vault;
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] exit=$$? — sleeping 300s";
           sleep 300;
         done
     volumes:
-      # Read-only mount for input decrypted data and media configs
-      - "${WECHAT_VAULT_HOST_DIR:-~/.local/share/wechat-vault}:/vault:ro"
+      # 只读输入：解密快照 + 策略
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/decrypted:/vault/decrypted:ro"
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/config:/vault/config:ro"
+      # 可写输出：账本 / 物化媒体 / 导出 / 暂存
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/state:/vault/state:rw"
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/media:/vault/media:rw"
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/exports:/vault/exports:rw"
+      - "${WECHAT_VAULT_HOST_DIR:?set WECHAT_VAULT_HOST_DIR}/staging:/vault/staging:rw"

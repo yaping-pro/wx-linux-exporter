@@ -59,11 +59,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Validate Docker Compose Config
+      - name: Validate Docker Compose Config (API & Worker profiles)
         env:
           WECHAT_TOKEN: "ci_test_token_0123456789abcdef"
+          WECHAT_VAULT_HOST_DIR: "/tmp/fake_vault"
         run: |
-          docker compose config
+          docker compose --profile api config
+          docker compose --profile worker config
 
       - name: Build Docker image (standard)
         run: |
