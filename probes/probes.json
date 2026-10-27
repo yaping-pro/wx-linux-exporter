@@ -1,0 +1,122 @@
+[
+  {
+    "id": "probe_01_text_table",
+    "type": "text_table",
+    "asset_id": "10000000000000000000000000000001",
+    "question": "表格中周三夜班的值班人员是谁？值班地点在何处？",
+    "must_contain": ["周三", "王工", "主控机房"],
+    "must_not_contain": ["发票", "报销"],
+    "expect_empty": false,
+    "description": "排班表格OCR文字识别与关键词提取"
+  },
+  {
+    "id": "probe_02_text_notice",
+    "type": "text_notice",
+    "asset_id": "10000000000000000000000000000002",
+    "question": "这张通知的主要内容是什么？协议名称和生效日期是哪天？",
+    "must_contain": ["家庭医生", "解约提醒", "生效"],
+    "must_not_contain": ["违章罚单", "快递"],
+    "expect_empty": false,
+    "description": "服务协议通知关键条款解读"
+  },
+  {
+    "id": "probe_03_text_receipt",
+    "type": "text_receipt",
+    "asset_id": "10000000000000000000000000000003",
+    "question": "就诊凭证上的科室名称和就诊人是谁？",
+    "must_contain": ["呼吸内科", "张三"],
+    "must_not_contain": ["违章", "快递单号"],
+    "expect_empty": false,
+    "description": "门诊凭证文字与科室信息提取"
+  },
+  {
+    "id": "probe_04_photo_landscape",
+    "type": "pure_photo",
+    "asset_id": "20000000000000000000000000000001",
+    "question": "这张户外植物照片中能识别出哪些文字内容？",
+    "must_contain": [],
+    "must_not_contain": ["发票", "金额", "身份证号", "文字：", "包含以下文字"],
+    "expect_empty": true,
+    "description": "纯风景照片无文字检测防幻觉"
+  },
+  {
+    "id": "probe_05_photo_hardware",
+    "type": "pure_photo",
+    "asset_id": "20000000000000000000000000000002",
+    "question": "图中展示的设备上有无可见的文字标签或条形码信息？",
+    "must_contain": [],
+    "must_not_contain": ["发票", "印章", "签名", "报销金额", "图中文字为"],
+    "expect_empty": true,
+    "description": "机房硬件特写纯图像防误识"
+  },
+  {
+    "id": "probe_06_context_ops_incident",
+    "type": "chat_context",
+    "asset_id": "30000000000000000000000000000001",
+    "question": "这张报错截图是在哪个群聊中由谁发送的？前后在聊什么？",
+    "must_contain": ["运维保障核心群", "运维小李", "告警"],
+    "must_not_contain": ["家庭医生"],
+    "expect_empty": false,
+    "description": "群聊上下文锚点（群名、发送人、业务背景）定位"
+  },
+  {
+    "id": "probe_07_context_family_health",
+    "type": "chat_context",
+    "asset_id": "30000000000000000000000000000002",
+    "question": "该图片来自哪个会话？发送时间戳是多少？结合上下文在沟通什么？",
+    "must_contain": ["家庭医护互助群", "1750000000", "健康"],
+    "must_not_contain": ["技术运营"],
+    "expect_empty": false,
+    "description": "结合群名称与时间戳的会话上下文理解"
+  },
+  {
+    "id": "probe_08_context_project_dev",
+    "type": "chat_context",
+    "asset_id": "30000000000000000000000000000003",
+    "question": "这张架构图属于哪个群？由谁分享？群内前后讨论的核心主题是什么？",
+    "must_contain": ["架构评审专班", "架构师老张", "微服务"],
+    "must_not_contain": ["发票", "门诊"],
+    "expect_empty": false,
+    "description": "研发群会话参与者与讨论主题归纳"
+  },
+  {
+    "id": "probe_09_counter_amount",
+    "type": "counter_hallucination",
+    "asset_id": "40000000000000000000000000000001",
+    "question": "这张巡检记录截图中提到的报销金额和审批单号是多少？",
+    "must_contain": ["图中没有", "未提及"],
+    "must_not_contain": ["¥", "5000元", "元整", "发票代码", "审批通过"],
+    "expect_empty": false,
+    "description": "反例探针：提问图中不存在的金额与单号，要求模型如实回答未提及"
+  },
+  {
+    "id": "probe_10_counter_tracking",
+    "type": "counter_hallucination",
+    "asset_id": "40000000000000000000000000000002",
+    "question": "请提取图中的顺丰快递运单号与收件人身份证号？",
+    "must_contain": ["没有", "未包含"],
+    "must_not_contain": ["SF", "运单号:", "110101", "身份证号为"],
+    "expect_empty": false,
+    "description": "反例探针：提问图中不存在的敏感个人标识与物流编码"
+  },
+  {
+    "id": "probe_11_video_frame_monitoring",
+    "type": "video_first_frame",
+    "asset_id": "50000000000000000000000000000001",
+    "question": "这段视频的首帧画面展示了什么监控场景？",
+    "must_contain": ["机房", "机柜", "指示灯"],
+    "must_not_contain": ["发票", "合同"],
+    "expect_empty": false,
+    "description": "短视频首帧/海报画面视觉内容理解"
+  },
+  {
+    "id": "probe_12_video_frame_drill",
+    "type": "video_first_frame",
+    "asset_id": "50000000000000000000000000000002",
+    "question": "应急演练视频封面中可以看到哪些现场元素和大屏内容？",
+    "must_contain": ["演练", "大屏", "指挥中心"],
+    "must_not_contain": ["身份证", "付款金额"],
+    "expect_empty": false,
+    "description": "演练现场视频海报帧主题与元素抽取"
+  }
+]

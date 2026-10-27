@@ -51,6 +51,9 @@ jobs:
           export PYTHONPATH="$PWD:${PYTHONPATH:-}"
           for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
 
+      - name: Probe suite self-check
+        run: python3 clients/muse_probe.py --score --expect probes/probes.json --dry-run --fail-under 0.0
+
   docker-check:
     runs-on: ubuntu-latest
     steps:
