@@ -4,6 +4,37 @@
 
 ---
 
+## 安装方式（二选一）
+
+### 方式 A：pipx 安装（推荐，陌生人直接可用）
+适合将工具作为系统 CLI 工具直接使用：
+```bash
+# 安装核心 CLI 命令 (wxexport, wxmedia, wxbridge, wxprobe)
+pipx install .
+
+# 若需要可选依赖（如本地 OCR、zstd 压缩）：
+pipx install ".[ocr,zstd]"
+
+# 验证 CLI 命令可用
+wxexport --help
+wxmedia --help
+wxprobe --help
+wxbridge --help
+```
+
+### 方式 B：git clone 源码运行
+适合开发调试或流水线调度：
+```bash
+git clone https://github.com/yaping-pro/wx-linux-exporter.git
+cd wx-linux-exporter
+pip install -r requirements.txt
+
+# 验证直接运行
+python3 bin/wechat_export_api.py --help
+python3 bin/wechat_media.py --help
+```
+
+---
 ## 1. 前置条件检查
 
 在开始前，请确保满足以下条件：
@@ -97,12 +128,15 @@ echo "Generated Token: ${WECHAT_TOKEN}"
 
 ### 步骤 4.2 启动只读 API 进程
 ```bash
-python3 bin/wechat_export_api.py \
+# 推荐使用 CLI (pipx install)
+wxexport \
   --host 127.0.0.1 \
   --port 8765 \
   --vault-dir ~/.local/share/wechat-vault/decrypted/current \
   --token "${WECHAT_TOKEN}"
-```
+
+# 或使用源码直接运行
+# python3 bin/wechat_export_api.py --host 127.0.0.1 --port 8765 --vault-dir ~/.local/share/wechat-vault/decrypted/current --token "${WECHAT_TOKEN}"
 
 *预期控制台输出*：
 ```text
@@ -174,11 +208,14 @@ curl -s "http://127.0.0.1:8765/health" | jq .
 ```
 运行后台媒体处理器：
 ```bash
-python3 bin/wechat_media.py \
+# 推荐使用 CLI (pipx install)
+wxmedia \
   --policy ~/.local/share/wechat-vault/config/media_policy.json \
   --vault ~/.local/share/wechat-vault \
   --max-items 20 -v
-```
+
+# 或使用源码直接运行
+# python3 bin/wechat_media.py --policy ~/.local/share/wechat-vault/config/media_policy.json --vault ~/.local/share/wechat-vault --max-items 20 -v
 
 ### 6.2 开启视频 (`kinds.video=true`)
 在 `media_policy.json` 中配置 `kinds.video: true`，`wechat_media.py` 会自动扫描硬链接并提取视频元数据与封面图（`poster`）。

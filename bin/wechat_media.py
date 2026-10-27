@@ -30,14 +30,22 @@ import sqlite3
 import subprocess
 import sys
 import time
-import zstandard
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SCRIPT_DIR = Path(__file__).resolve().parent
-MINERU_CLIENT = SCRIPT_DIR / "mineru_agent.py"
+try:
+    import mineru_agent
+    _mf = getattr(mineru_agent, "__file__", None)
+    MINERU_CLIENT = Path(_mf).resolve() if _mf else SCRIPT_DIR / "mineru_agent.py"
+except ImportError:
+    MINERU_CLIENT = SCRIPT_DIR / "mineru_agent.py"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import wx_store  # noqa: E402
@@ -131,7 +139,7 @@ def extract_voice_text(packed) -> str:
     b = bytes(packed) if isinstance(packed, (bytes, bytearray, memoryview)) else b""
     if not b:
         return ""
-    if b[:4] == ZSTD_MAGIC:
+    if b[:4] == ZSTD_MAGIC and zstandard is not None:
         try:
             b = zstandard.ZstdDecompressor().decompress(b)
         except Exception:  # noqa: BLE001
@@ -222,7 +230,7 @@ def decompress(raw) -> str:
         return ""
     b = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode("utf-8", "replace")
     b = bytes(b)
-    if b.startswith(ZSTD_MAGIC):
+    if b.startswith(ZSTD_MAGIC) and zstandard is not None:
         try:
             return zstandard.ZstdDecompressor().decompress(b).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001

@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Enable running directly from repo root or clients/ dir
 _CLIENTS_DIR = Path(__file__).resolve().parent
-if str(_CLIENTS_DIR) not in sys.path:
+if _CLIENTS_DIR.exists() and str(_CLIENTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CLIENTS_DIR))
 
 try:
