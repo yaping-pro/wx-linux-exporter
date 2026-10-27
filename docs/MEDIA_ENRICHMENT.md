@@ -60,9 +60,45 @@ sudo systemctl enable --now wechat-media.timer
 
 1. **会话闸**：`chat_allowlist`（用 `xxx@chatroom` / `wxid_xxx` 稳定 ID）
 2. **类型闸**：`kinds.{file,image,voice,video}` + `file_ext_allow` / `skip_ext`
-3. **预算闸**：`daily_file_budget`、`max_items_per_run`、`max_bytes` + md5 去重
+3. **预算闸**：`daily_budget.{file,image,video}`、`max_items_per_run`、`max_bytes` + md5 去重
 
 > ⚠️ 白名单同时管「解析」和「投递」：把会话移出白名单后，其已解析内容也不再注入。
+
+#### 日预算按类型独立计算
+
+```jsonc
+"daily_budget": { "file": 30, "image": 2000, "video": 50 }
+```
+
+| 类型 | 默认值 | 消耗什么 | 为什么这么定 |
+| :--- | ---: | :--- | :--- |
+| `file` | 30 | MinerU 云端调用次数 | **唯一有真金白银成本**的类型：每个文件走 agent 或 precise 通道，额度有限 |
+| `image` | 2000 | 本地解密出图次数 | 用 `wechat_image` 本地解密，**零云端成本**，因此预算比 file 高两个数量级 |
+| `video` | 50 | 本地转封装次数 | 本地 ffmpeg 转封装，无云端成本；但体积大、耗 IO，保留适度上限 |
+| `voice` | — | **不消耗** | 微信自带转写文本，worker 只做搬运，零成本 |
+
+> **关键**：三类预算**互不影响**。image 出多少图都不会占用 file 的 MinerU 额度。
+>
+> 历史上三者共用一个 `daily["parsed"]` 计数器，导致图片把 `daily_file_budget: 30`
+> 吃满后，文件解析整天空转（日志表现为 `今日预算用尽`）。自本次修复起按类型分账。
+
+**兼容性**
+
+- 旧 policy 只写 `daily_file_budget: 30` → 自动映射为 `daily_budget.file = 30`，
+  `image` / `video` 取默认值。
+- 旧账本（`daily` 里没有 `by_kind`）→ 读取侧按 0 计，**不回写、不迁移历史数据**。
+- 账本新结构：`daily.<date>.by_kind.{file,image,video}`，聚合字段 `parsed` / `bytes`
+  保持同步更新，旧看板不受影响。
+  ```jsonc
+  "daily": {
+    "2026-10-28": { "parsed": 30, "skipped": 0, "bytes": 19398726,
+                    "by_kind": { "file": 30, "image": 58, "video": 0 } }
+  }
+  ```
+
+**被预算挡下时**：worker 在 `ledger.budget_blocked[<chat>|<local_id>]` 记录一条提示
+（`deny_reason` 为 `<kind>_budget_exhausted`），**不写终态**，次日预算重置后自动重试。
+`max_items_per_run` 仍是全局总量闸（防单轮跑太久），不参与按类型分账。
 
 ---
 
