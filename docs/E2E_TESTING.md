@@ -127,3 +127,40 @@ python3 clients/muse_probe.py \
 * **具体文字识别**：模型必须准确说出图片或首帧中的具体文字（如招牌名、文档标题、聊天截图中的对话）、具体物体与场景特征，不得含糊泛泛描述（如仅回答「这是一张室内照片」）；
 * **无文字场景求真**：对于无文字的风光、纯景物或头像照片，模型必须如实回答「图中没有文字」或「未检测到文本」，**严禁无中生有、编造文字**；
 * **时空上下文一致性**：模型回答需与消息文本中的会话名称、发送时间保持语义一致。
+
+---
+
+## 6. 变异测试（Mutation Testing）
+
+### 为什么需要它
+普通回归测试只能证明「好代码能跑过」，却无法证明「防御性的 if/校验真的在拦错」。E2E 流水线（`tests/test_e2e_pipeline.py` 的 `test_01`～`test_06`）覆盖了正常路径与失败路径（只读 state 目录退出非 0、blocklist 防泄漏 404/403、401 鉴权等）。但这些断言是否真的「卡住」了错误逻辑，要靠**语义变异**来检验：故意把产品代码改坏一行，若测试仍全绿，说明该防御是死的；若测试转红，说明拦截真实有效。100% 被 E2E 捕获 = 防御不是装饰。
+
+### 实测变异表（来自 PR #17 正文，已执行）
+
+> 这些变异均已还原，`git diff` 为空；执行日期 2026-10-27，仓库 commit `9fa66bd`。数据来自 PR #17「变异测试（Mutation Testing）验证结果」一节——7 处语义注入变异**全部被测试套件精准捕获杀死**。
+
+| # | 变异位置 | 改动 | 被哪个用例杀死 | 报错原文 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `bin/wechat_export_api.py:842` `next_cursor = encode_cursor(...)` | → `next_cursor = None` | `test_02_api_export_all_and_filters` | `AssertionError: unexpectedly None : Expected next_cursor in p1` |
+| 2 | `bin/wechat_export_api.py:916` `"ocr_chars": ... if ocr_mode != "none" else 0` | → `... else 99` | `test_02_api_export_all_and_filters` | `AssertionError: 99 != 0 : ocr_chars should be 0 when ocr=none` |
+| 3 | `bin/wechat_export_api.py:958` `def check_auth(self): return True` | 绕过 Bearer Token 校验 | `test_02_api_export_all_and_filters` | `AssertionError: Expected 401 for unauthenticated export` |
+| 4 | `bin/wechat_export_api.py:550` `if blocklist: pass` | 导致屏蔽会话消息泄漏 | `test_02_api_export_all_and_filters`（消息顺序污染）、`test_05_probe_audit_and_vision`（审计拦截泄漏） | 原文未记录 |
+| 5 | `bin/wechat_export_api.py:1479` `if False and file_size > 0:` | 视频分片回退整文件 200 | `test_03_media_endpoints` | `AssertionError: 200 != 206` |
+| 6 | `bin/wechat_media.py:1506` `export_file.write_bytes(final_data)` | → `pass`（图片文件未落盘） | `test_01_worker_to_ledger`（FileNotFoundError）、`test_03_media_endpoints`（HTTP 404） | 原文未记录 |
+| 7 | `bin/wx_contract.py:18` `def media_note(...): return "图片"` | 破坏视频等媒体的 note 语义 | `test_02_api_export_all_and_filters` | `AssertionError: '图片' != '视频'` |
+
+### 如何自己重跑一条变异
+变异测试本质是一次「人工红绿对照」：在同一份代码上做一次正向验证、一次反向破坏，对比测试结果。下面以第 2 条变异（OCR 统计契约）为例，给出可直接复制的命令——`sed` 的匹配串已确认在当前 `bin/wechat_export_api.py:916` 真实存在：
+
+```bash
+# 1) 改坏一行（例：让 ocr_chars 在 ocr=none 时返回 99）
+sed -i '' 's/ocr_chars_count if ocr_mode != "none" else 0/ocr_chars_count if ocr_mode != "none" else 99/' bin/wechat_export_api.py
+# 2) 期望看到 FAILED
+python3 -m pytest tests/test_e2e_pipeline.py -q
+# 3) 还原
+git checkout -- bin/wechat_export_api.py && git diff --stat   # 应为空
+```
+
+也支持对其它防御逻辑手动破坏（例如放宽 `blocklist` 防泄漏判断、删掉 `test_06_failure_path_readonly_state` 所依赖的只读退出分支）：跑 pytest 时应至少有一条用例**转红**（变异被杀）；若仍全绿，则该防御未被测试覆盖，需补断言。
+
+> 提示：变异测试是开发期人工验证手段，**不进入 CI 常驻运行**（CI 只跑未变异的 `lint-and-test` 与 `docker-check`）。它用于确认「你写的防御真的在起作用」。

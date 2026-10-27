@@ -115,12 +115,12 @@ bash scripts/selfcheck.sh
 
 > **默认关闭**。富化后在保持结构兼容的前提下，把纯占位符拓展为可读、可取的媒体元数据。开启前请查阅 [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md) 与 [`docs/MEDIA_ENRICHMENT.md`](docs/MEDIA_ENRICHMENT.md)。
 
-| 媒体类型 | 支持状态 | 实现机制 | 成本 / 边界说明 |
+| 媒体类型 | 状态 | 实现 | 验证证据 |
 | :--- | :--- | :--- | :--- |
-| **图片** | ✅ **完全支持** | 本地解密原图落盘 + 绝对路径 `media_url_abs` + 可选 RapidOCR 文本投影 | 纯本地处理，零网络开销；Muse 侧可直接接多模态大模型 |
-| **视频** | ✅ **落盘 + 元数据** | 扫描本地硬链接提取 MP4、时长与封面 (`poster`) | **不做本地转码/ASR**；**实机实测均为明文 MP4**（未见加密容器；异常/无法识别时标记 `note: "视频（不可解密）"`） |
-| **语音** | ✅ **完全支持** | 纯读本地 `packed_info_data` 提取微信客户端自带转文字 | **零成本**：本地提取微信转写结果，无网络/无模型消耗 |
-| **文件附件** | ✅ **可选支持** | MinerU **agent 免费通道** (≤10MB) / **precise 通道** (≤200MB) | 需用户显式配置并自愿开启云端解析 |
+| **图片** | ✅ 完全支持 | 本地解密原图落盘 + 绝对路径 `media_url_abs` + 可选 RapidOCR 文本投影 | 实机 18,402 样本全解（V2 三段式 / kvcomm 离线推导；jpg 80.65% / wxgf 11.75% / png 7.60%，画质 hd 16.07% / full 29.42% / 仅缩略图 54.51%）；E2E `test_01_worker_to_ledger` / `test_03_media_endpoints`；7 项语义变异 100% 被 E2E 捕获（表见 docs/E2E_TESTING.md §6） |
+| **视频** | ✅ 落盘 + 元数据 | 扫描本地硬链接提取 MP4、时长与封面 (`poster`)；`ftyp` 明文容器，无加密 | 实机 146/146 样本头部为 `ftyp`（明文 MP4），未观测加密容器；E2E `test_01`（`duration_s>0` 断言）/ `test_03`（Range 206 + Content-Range） |
+| **语音** | ✅ 完全支持 | 纯读本地 `packed_info_data` 提取微信客户端自带转文字 | 零网络、无模型；E2E `test_01`（`kind=voice` 入账本）；7 项语义变异 100% 被 E2E 捕获（表见 docs/E2E_TESTING.md §6） |
+| **文件附件** | ✅ 可选支持 | MinerU agent 免费通道 (≤10MB) / precise 通道 (≤200MB) | E2E `test_01`（fixtures 内置 `local_type=49` 文件消息，worker 入 ledger）走合成文件资产；7 项语义变异 100% 被 E2E 捕获（表见 docs/E2E_TESTING.md §6） |
 ```bash
 # 1) 生成策略（默认 enabled=false）
 cp config/media_policy.example.json config/media_policy.json
@@ -130,6 +130,14 @@ python3 bin/wechat_media.py --policy config/media_policy.json --dry-run -v
 # 4) 放行
 sudo systemctl enable --now wechat-media.timer
 ```
+
+> 「验证证据」列指向可复现的测试或实测样本数；`pytest tests -q` → 194 passed，`python3 tests/test_e2e_pipeline.py` 可离线独立运行。
+
+### 质量门禁
+
+- **CI 强制项**：4 个 Python 版本（3.10 / 3.11 / 3.12 / 3.13）×（编译 `py_compile` / lint `flake8` / schema 校验 / shell 语法 / webhook 字段映射回归 / E2E / probe 自检）+ `docker-check`（compose 双 profile `api`/`worker` 校验 + 镜像构建）+ compose 挂载权限校验（`test_compose_mounts.py`）。
+- **分支保护**：`main` 要求 status check 全过方可合并（实际门禁由 `lint-and-test` 矩阵 4 个 Python 版本 job 与 `docker-check` job 构成，详见 `.github/workflows/ci.yml`）。
+- **变异测试**：7 项语义变异 100% 被 E2E 捕获（表见 [`docs/E2E_TESTING.md` §6](docs/E2E_TESTING.md)），执行日期 2026-10-27、commit `9fa66bd`。
 
 **三层闸**：会话白名单 → 类型/扩展名 → 日预算 + md5 去重。任一不过就不花钱，且跳过原因全部记入 `state/media_ledger.json` 的 `deny_reason` 供审计。
 
