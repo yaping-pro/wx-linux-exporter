@@ -12,7 +12,14 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import sys
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _p in (_ROOT, _ROOT / "bin"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 
 from bin import wechat_export_api
 
