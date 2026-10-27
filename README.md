@@ -182,6 +182,7 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 ```
 
 </details>
+- 生产发布（家服 systemd 主机）采用**快照式原子部署**：`scripts/deploy-snapshot.sh` 建时间戳快照目录、原子切软链接、重启并做健康断言，失败时自动回滚。详见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 ### 🐳 容器化部署 (Docker & Compose)
 
