@@ -48,7 +48,7 @@ jobs:
 
       - name: Regression tests
         run: |
-          export PYTHONPATH="$PWD:$PWD/bin:${PYTHONPATH:-}"
+          export PYTHONPATH="$PWD:${PYTHONPATH:-}"
           for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
 
   docker-check:
