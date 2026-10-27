@@ -444,7 +444,28 @@ media=all (image + video)      | 142.10 KB        | 3.14x
 生产真实微信图片在 Muse 消费端完成了端到端验收验证：
 - **测试结果**：生产真实微信图片 **9/9 命中、0 幻觉、3/3 反幻觉正确否认**。
 - **本地 OCR 独立性**：`image.ocr.enabled=false` 完全不影响识别效果（Muse 走自己的多模态视觉大模型通道）。
+- **策略边界指示**：
+  - ⏸️ **视频功能暂时不开**；
+  - ⏸️ **历史回填暂停**；
+  - 以上两项保持挂起状态，当前专注于增量实时图片富化与按需消费。
 
-> ⚠️ **关键警告：记忆幻觉与网络隔离**  
-> 1. **切勿使用已上传过的图片验证 URL 拉取**：Muse 在拿到一个**已在对话中上传过**的图片 URL 时，会用记忆/上下文“回答出”看似正确的内容（实测：它描述了一张图并说“和你前面发的是同一张”，但 activity panel 显示 `Searched memory for ...`，并非真实拉取）。**验证 URL 拉取能力时必须用 Muse 从未见过的图**。  
-> 2. **私网隔离限制**：`100.67.218.81` 是 Tailscale 私网地址，Muse 云端与它的浏览器都不可达，实测在 network 层就失败（`TypeError: Failed to fetch`），根本走不到 401——所以 **URL 模式需要公网可达 + Bearer 支持，当前只能走文件上传**。
+> ⚠️ **关键说明：网络边界与防记忆幻觉**  
+> 
+> 1. **防记忆幻觉（评测隔离原则）**：
+>    - **切勿使用已在对话中上传过的图片验证 URL 拉取**：Muse 在拿到一个已在对话历史中出现过的图片 URL 时，会触发上下文记忆召回（Activity Panel 显示 `Searched memory for ...`），凭借先验信息“回答出”看似正确实为假阳性的结果（实测会回答“和你前面发的是同一张”）。
+>    - **基准评测规则**：验证 URL 模式或视觉拉取能力时，**必须使用 Muse 从未见过的全新图片**。
+>
+> 2. **网络架构与可达性边界（Tailscale 内网 vs Web 浏览器前端）**：
+>    此前在 Web 浏览器控制台执行 `fetch("http://100.67.218.81:8765/...")` 出现 `TypeError: Failed to fetch`，系**浏览器安全沙箱限制**导致的误判。必须明确区分两种访问场景：
+>
+>    - **场景 A：Muse 后端 Agent 运行在 Tailscale 内网（原生推荐模式）**：
+>      * **网络拓扑**：Muse 本身是独立的 Tailscale 节点（在 Tailnet 中拥有专属内网 IP，如 `100.114.57.95`，与家服 `linux1` 的 `100.67.218.81` 处于同一虚拟局域网）。
+>      * **完全直达**：Muse 后端 Agent 或驻留服务可直接通过内网 Tailscale 地址拉取数据与原图：
+>        - 导出元数据：`GET http://100.67.218.81:8765/api/wechat/export`
+>        - 媒体二进制：`GET http://100.67.218.81:8765/api/wechat/media/<asset_id>/image.<fmt>`
+>      * **鉴权要求**：请求必须附带 Header `Authorization: Bearer <WECHAT_TOKEN>`。
+>      * **推荐工作流**：下游 Webhook（或 `clients/assistant_webhook.py`）配置 `--public-base-url http://100.67.218.81:8765` 生成 `media_url_abs`，Muse 后端 Agent 消费该 URL 直接下载原图二进制流喂给视觉大模型，无需经由任何公网暴露或文件二次上传。
+>
+>    - **场景 B：外部浏览器 Web 前端界面直接 fetch（如 https://muse.ai 页面前端）**：
+>      * **受限原因**：受浏览器 **Mixed Content**（HTTPS 页面被浏览器强制禁止直接向非加密 HTTP 接口发起 XHR/Fetch 请求）以及 **CORS / 私网访问安全规范（Private Network Access）** 拦截，网页前端 JS 在网络协议栈最顶层即被浏览器沙箱拦截，根本无法触达私网端口（表现为 `TypeError: Failed to fetch`）。
+>      * **正确链路**：Web 浏览器前端不应直连私网端口，而应由位于 Tailnet 内的 Muse 后端 Agent 代理下载，或通过本地文件/Base64 上传。
