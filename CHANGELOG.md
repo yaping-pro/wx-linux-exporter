@@ -6,6 +6,12 @@
 ---
 
 ## [Unreleased]
+### Added
+- **Muse 消费端生产全量上线与手写排班表视觉验收 (`docs/INTEGRATIONS.md`)**：
+  - 消费端 `fetch_wechat.py` 启用 `--media`（带 `media=image&ocr=none`）与自动落盘/生命周期清理；
+  - 4 项巡检 Cron（08:14/12:14/16:14/20:14）与 1 项早报 Cron（08:10）全量切换并回读验证；
+  - 生产真实手写排班表（1280×1706 PNG，864KB）端到端拉取与多模态视觉理解验证通过（0 故障，精准识别 5~8 楼多科室排班、各医生预约量与门诊手写排班）；
+  - 明确 `chat_allowlist` 隐私护栏与 `missing_source` 未下载排障指引。
 
 ---
 
