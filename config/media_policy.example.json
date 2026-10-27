@@ -40,7 +40,7 @@
     "token_file": null
   },
   "max_items_per_run": 10,
-  "daily_file_budget": 30,
+  "daily_budget": { "file": 30, "image": 2000, "video": 50 },
   "lookback_hours": 72,
   "initial_since_days": 7,
   "dedupe": { "by": "md5", "ttl_days": 180 },

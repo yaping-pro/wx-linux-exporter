@@ -10,15 +10,26 @@ User=__WXUSER__
 Group=__WXUSER__
 WorkingDirectory=__WXHOME__/.local/share/wechat-vault
 Environment=WECHAT_VAULT_ROOT=__WXHOME__/.local/share/wechat-vault
+Environment=PYTHONUNBUFFERED=1
+# No Restart=: a failed run is retried by the timer's next tick. Restart= on a
+# oneshot would hammer a persistently failing worker (e.g. a MinerU outage).
 # Optional credential for the MinerU "precise" channel (files >10MB, html/doc/xls/ppt).
 # The token-free "agent" channel needs no credential. To enable the precise channel:
 #   sudo systemd-creds encrypt --name=mineru-token --with-key=host - \
 #        /etc/wechat-vault/mineru-token.cred
-# then uncomment the line below and `systemctl daemon-reload`.
-#LoadCredentialEncrypted=mineru-token:/etc/wechat-vault/mineru-token.cred
+LoadCredentialEncrypted=mineru-token:/etc/wechat-vault/mineru-token.cred
 ExecStart=/usr/bin/python3 __WXHOME__/.local/share/wechat-vault/bin/wechat_media.py --policy __WXHOME__/.local/share/wechat-vault/config/media_policy.json --vault __WXHOME__/.local/share/wechat-vault
+# --- Resource containment: personal home box, not a dedicated worker. ---
+# Holds one decrypted SQLite snapshot + one image in flight; 28.7M peak observed.
+# 2G is ~70x headroom, still caps a runaway decode before it takes the box down.
+MemoryMax=2G
+# Decode is bursty-parallel; above 1 core drains the backlog, but can never
+# saturate every core the interactive desktop needs.
+CPUQuota=150%
 Nice=10
 IOSchedulingClass=idle
-TimeoutStartSec=3600
+# Hard ceiling. Tick is 15min; an overrunning run must be killed rather than
+# overlap the next tick (overlap is a silent no-op via the worker's flock).
+TimeoutStartSec=1800
 StandardOutput=journal
 StandardError=journal

@@ -187,6 +187,85 @@ DEFAULT_POLICY_BODY = {
     "render": {"max_chars_per_doc": 4000, "inject_into_text": False},
 }
 
+# Per-kind daily budgets. "file" is metered because each entry costs a MinerU cloud
+# call; "image"/"video" are decrypted locally for free, so they must NOT be charged
+# against the file budget -- otherwise a busy image day silently starves file parsing
+# (observed: images pinned daily.parsed at 30/30 and every file run went no-op).
+# "voice" is never charged: WeChat ships the transcript, so it costs nothing.
+DEFAULT_KIND_BUDGETS = {"file": 30, "image": 2000, "video": 50}
+
+BUDGET_BLOCKED_SUFFIX = "_budget_exhausted"
+
+
+def defer_for_budget(ledger: dict, kind: str, key: str, ct: int, summary: dict) -> None:
+    """Record that `kind`'s daily budget blocked this message, for tomorrow's retry.
+
+    Writes a hint entry only (never a terminal state), so the message is re-examined
+    once the daily counter resets. The `key` mapping is deliberately left unmoved.
+    """
+    blocked = ledger.setdefault("budget_blocked", {})
+    entry = blocked.get(key)
+    if entry is None:
+        entry = {"kind": kind, "count": 0, "first_ct": ct, "last_ct": ct}
+        blocked[key] = entry
+    entry["count"] = int(entry.get("count") or 0) + 1
+    entry["last_ct"] = ct
+    entry["deny_reason"] = f"{kind}{BUDGET_BLOCKED_SUFFIX}"
+    summary["deferred"] = summary.get("deferred", 0) + 1
+
+
+def resolve_kind_budgets(policy: dict) -> dict[str, int]:
+    """Return the per-kind daily budget map, tolerating the legacy single-key form.
+
+    New form:  "daily_budget": {"file": 30, "image": 2000, "video": 50}
+    Legacy:    "daily_file_budget": 30 -> file=30, image/video keep defaults.
+    """
+    budgets = dict(DEFAULT_KIND_BUDGETS)
+    raw = policy.get("daily_budget")
+    if isinstance(raw, dict):
+        for kind, value in raw.items():
+            try:
+                budgets[str(kind)] = int(value)
+            except (TypeError, ValueError):
+                continue
+    if "daily_budget" not in policy:
+        legacy = policy.get("daily_file_budget")
+        if legacy is not None:
+            try:
+                budgets["file"] = int(legacy)
+            except (TypeError, ValueError):
+                pass
+    return budgets
+
+
+def kind_used(daily: dict, kind: str) -> int:
+    """Units of `kind` consumed today.
+
+    Old ledgers predate `by_kind`; read those as 0 rather than migrating or rewriting
+    history, so an upgraded worker never inherits a polluted counter.
+    """
+    by_kind = daily.get("by_kind")
+    if not isinstance(by_kind, dict):
+        return 0
+    try:
+        return int(by_kind.get(kind) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def charge_kind(daily: dict, kind: str, amount: int = 1, nbytes: int = 0) -> None:
+    """Charge one unit of `kind` to today's counters (per-kind + legacy aggregate)."""
+    by_kind = daily.get("by_kind")
+    if not isinstance(by_kind, dict):
+        by_kind = {}
+        daily["by_kind"] = by_kind
+    by_kind[kind] = int(by_kind.get(kind) or 0) + amount
+    # Aggregate fields stay in sync for dashboards/tests reading the old shape.
+    daily["parsed"] = int(daily.get("parsed") or 0) + amount
+    daily["bytes"] = int(daily.get("bytes") or 0) + nbytes
+
+
+
 
 def log(msg: str, verbose: bool = True) -> None:
     if verbose:
@@ -942,9 +1021,10 @@ def main() -> int:
     ledger_path = vault / "state" / "media_ledger.json"
     ledger = load_ledger(ledger_path)
     today = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d")
-    daily = ledger["daily"].setdefault(today, {"parsed": 0, "skipped": 0, "bytes": 0})
+    daily = ledger["daily"].setdefault(today, {"parsed": 0, "skipped": 0, "bytes": 0, "by_kind": {}})
 
-    budget = int(policy.get("daily_file_budget") or 0)
+    budgets = resolve_kind_budgets(policy)
+    budget = budgets["file"]
     max_items = args.max_items if args.max_items is not None else int(policy.get("max_items_per_run") or 10)
     precise_cfg = policy.get("precise") or {}
     precise_max_bytes = int(precise_cfg.get("max_bytes") or PRECISE_MAX_BYTES)
@@ -990,7 +1070,7 @@ def main() -> int:
         since = (wm - lookback) if wm else int(time.time()) - initial_days * 86400
     since = max(0, since)
     log(f"[INFO] since={datetime.fromtimestamp(since, SHANGHAI_TZ).isoformat()}  "
-        f"budget={daily['parsed']}/{budget}  max_items={max_items}  "
+        f"budget=file:{kind_used(daily, 'file')}/{budgets['file']} image:{kind_used(daily, 'image')}/{budgets['image']} video:{kind_used(daily, 'video')}/{budgets['video']}  max_items={max_items}  "
         f"precise_token={'available' if token_ok else 'unavailable'}")
 
     staging_root = vault / "staging" / "media"
@@ -1012,8 +1092,10 @@ def main() -> int:
         if processed >= max_items:
             log("[INFO] 达到本轮 max_items 上限，收工。")
             break
-        if daily["parsed"] >= budget:
-            log("[INFO] 今日预算用尽，收工。")
+        key = f"{chat}|{lid}"
+        if kind_used(daily, "file") >= budgets["file"]:
+            defer_for_budget(ledger, "file", key, ct, summary)
+            log("[INFO] 今日文件预算用尽，收工。")
             break
 
         m_md5 = re.search(r"<md5>([0-9a-f]{32})</md5>", text)
@@ -1148,8 +1230,7 @@ def main() -> int:
             rec["md_path"] = payload.get("md_path")
             rec["chars"] = payload.get("chars")
             rec["text_head"] = (out_dir / "full.md").read_text(encoding="utf-8", errors="replace")[:max_chars]
-            daily["parsed"] += 1
-            daily["bytes"] += size
+            charge_kind(daily, "file", 1, size)
             summary["ready"] += 1
         else:
             if state == "skipped":
@@ -1263,8 +1344,10 @@ def main() -> int:
             if processed >= max_items:
                 log("[INFO] 达到本轮 max_items 上限，收工。")
                 break
-            if daily["parsed"] >= budget:
-                log("[INFO] 今日预算用尽，收工。")
+            key = f"{chat}|{lid}"
+            if kind_used(daily, "image") >= budgets["image"]:
+                defer_for_budget(ledger, "image", key, ct, summary)
+                log("[INFO] 今日图片预算用尽，收工。")
                 break
 
             key = f"{chat}|{lid}"
@@ -1540,8 +1623,7 @@ def main() -> int:
             ledger["assets"][asset_id] = rec
             mark(key, asset_id, ct)
             ledger.setdefault("anchors", {})[key] = anchor
-            daily["parsed"] += 1
-            daily["bytes"] += len(final_data)
+            charge_kind(daily, "image", 1, len(final_data))
             summary["ready"] += 1
             processed += 1
             log(f"[OK] Image {chat} lid={lid} {asset_id} -> {export_file} "
@@ -1585,8 +1667,10 @@ def main() -> int:
             if processed >= max_items:
                 log("[INFO] 达到本轮 max_items 上限，收工。")
                 break
-            if daily["parsed"] >= budget:
-                log("[INFO] 今日预算用尽，收工。")
+            key = f"{chat}|{lid}"
+            if kind_used(daily, "video") >= budgets["video"]:
+                defer_for_budget(ledger, "video", key, ct, summary)
+                log("[INFO] 今日视频预算用尽，收工。")
                 break
 
             key = f"{chat}|{lid}"
@@ -1902,8 +1986,7 @@ def main() -> int:
             ledger["assets"][asset_id] = rec
             mark(key, asset_id, ct)
             ledger.setdefault("anchors", {})[key] = anchor
-            daily["parsed"] += 1
-            daily["bytes"] += actual_size
+            charge_kind(daily, "video", 1, actual_size)
             summary["ready"] += 1
             processed += 1
             log(f"[OK] Video {chat} lid={lid} {asset_id} -> {export_video} ({actual_size}B)")
