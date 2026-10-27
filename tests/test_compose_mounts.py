@@ -40,18 +40,38 @@ class TestComposeMounts(unittest.TestCase):
     def _get_services(self):
         if self.compose_data:
             return self.compose_data.get("services", {})
-        # Simple fallback parsing when PyYAML is unavailable
+        # Robust fallback parser without external PyYAML dependency
         services = {}
         curr_svc = None
+        curr_section = None
         for line in self.raw_text.splitlines():
+            # Service definition (indent level 2: "  api:", "  worker:")
             m_svc = re.match(r"^ {2}([a-zA-Z0-9_-]+):", line)
             if m_svc:
                 curr_svc = m_svc.group(1)
-                services[curr_svc] = {"volumes": []}
-            elif curr_svc and re.match(r"^ {6}- ['\"]?(.*?)['\"]?$", line):
+                services[curr_svc] = {"volumes": [], "command": []}
+                curr_section = None
+                continue
+
+            # Sub-sections under service (indent level 4: "    volumes:", "    command:")
+            m_sec = re.match(r"^ {4}([a-zA-Z0-9_-]+):", line)
+            if m_sec:
+                curr_section = m_sec.group(1)
+                continue
+
+            if curr_svc and curr_section == "volumes":
                 m_vol = re.match(r"^ {6}- ['\"]?(.*?)['\"]?$", line)
                 if m_vol:
                     services[curr_svc]["volumes"].append(m_vol.group(1))
+            elif curr_svc and curr_section == "command":
+                strip_line = line.strip()
+                if strip_line.startswith("- >"):
+                    continue
+                if strip_line.startswith("- "):
+                    services[curr_svc]["command"].append(strip_line[2:].strip("\"'"))
+                elif strip_line:
+                    services[curr_svc]["command"].append(strip_line)
+
         return services
 
     def test_worker_volume_permissions(self):
@@ -69,6 +89,7 @@ class TestComposeMounts(unittest.TestCase):
 
         for vol in worker_vols:
             # Split by ':' from the right to safely handle ':' in ${VAR:?msg}
+            # Format: <host_path>:<container_path>:<mode>
             rparts = vol.rsplit(":", 2)
             self.assertEqual(len(rparts), 3, f"Volume '{vol}' must have host:container:mode structure")
             host_path, container_path, mode = rparts
@@ -113,6 +134,7 @@ class TestComposeMounts(unittest.TestCase):
                 container_path, {"/vault/exports", "/vault/staging"},
                 f"API should not mount internal staging/exports: '{container_path}'"
             )
+
     def test_worker_command_visibility_and_error_handling(self):
         """Worker command must expose exit code and must not swallow errors with || true."""
         services = self._get_services()
