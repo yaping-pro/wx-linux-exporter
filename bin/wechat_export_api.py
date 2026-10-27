@@ -24,6 +24,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+import wx_contract  # noqa: E402
 try:
     from wechat_shards import message_db_paths
 except ImportError:
@@ -66,8 +67,8 @@ MEDIA_LEDGER_PATH = Path(
     os.environ.get("WECHAT_MEDIA_LEDGER", str(MEDIA_VAULT_ROOT / "state" / "media_ledger.json"))
 ).expanduser()
 _MEDIA_CACHE: dict[str, tuple[float, dict]] = {}
-ALLOWED_IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
-
+ALLOWED_MEDIA_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "mp4", "mov"}
+ALLOWED_IMAGE_EXTS = ALLOWED_MEDIA_EXTS
 
 def get_media_paths(server_context: dict[str, Any] | None = None) -> tuple[Path, Path, Path]:
     """解析 (media_vault_root, media_policy_path, media_ledger_path)。"""
@@ -232,33 +233,14 @@ def map_message_type(local_type: int, raw_text: str) -> tuple[str, str, str]:
         return "other", raw_text, "其他"
 
 
+def media_note(asset: dict[str, Any] | None, kind: str = "image") -> str:
+    """向后兼容转发至 wx_contract.media_note。"""
+    return wx_contract.media_note(asset, kind=kind)
+
+
 def image_note(asset: dict[str, Any] | None) -> str:
-    """根据 ledger 中图片资产的 state 与 deny_reason 映射细化 note。"""
-    if not asset:
-        return "图片"
-    state = asset.get("state")
-    reason = str(asset.get("deny_reason") or "")
-
-    if state == "ready":
-        return "图片"
-    elif state == "pending" or reason == "image_not_on_disk":
-        return "图片（处理中）"
-    elif state == "skipped":
-        if reason == "missing_source":
-            return "图片（未下载）"
-        elif reason == "skipped:animated":
-            return "图片（动图）"
-        elif reason == "max_pixels_exceeded":
-            return "图片（超大）"
-        elif reason in ("missing_keys", "skipped:decryptor_unavailable"):
-            return "图片（不可解密）"
-        elif reason.startswith("unresolved:"):
-            return "图片（无法定位）"
-        return "图片"
-    elif state == "failed":
-        return "图片（解析失败）"
-    return "图片"
-
+    """向后兼容的 image_note 别名。"""
+    return wx_contract.media_note(asset, kind="image")
 
 def load_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
     """Loads contacts from contact/contact.db."""
@@ -540,6 +522,9 @@ def export_wechat_data(
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
     server_context: dict[str, Any] | None = None,
+    media_filter: str = "all",
+    media_chats: set[str] | None = None,
+    ocr_mode: str = "head",
 ) -> dict[str, Any]:
     """Exports decrypted WeChat messages within the specified time range."""
     contacts = get_cached_contacts(vault_dir)
@@ -675,65 +660,49 @@ def export_wechat_data(
                     if media.get("enabled"):
                         mkey = f"{chat_id}|{local_id}"
                         asset = media["assets"].get(media["index"].get(mkey) or "")
-                        if kind == "image" and chat_id in media["allow_chats"]:
-                            note = image_note(asset)
+                        chat_in_media_filter = (
+                            media_chats is None or chat_id in media_chats
+                        )
+                        if (kind == "image" or kind == "video") and chat_id in media["allow_chats"]:
+                            note = media_note(asset, kind=kind)
+
+                        allow_kind_media = (
+                            (media_filter == "all" and kind in ("image", "video"))
+                            or (media_filter == "image" and kind == "image")
+                            or (media_filter == "video" and kind == "video")
+                        )
+
                         if (
                             asset
                             and asset.get("state") == "ready"
                             and chat_id in media["allow_chats"]
+                            and chat_in_media_filter
+                            and allow_kind_media
                         ):
-                            if asset.get("kind") == "image":
-                                anchor = dict(
-                                    media.get("anchors", {}).get(mkey)
-                                    or asset.get("anchor")
-                                    or {}
+                            anchor = dict(
+                                media.get("anchors", {}).get(mkey)
+                                or asset.get("anchor")
+                                or {}
+                            )
+                            anchor["chat_id"] = chat_id
+                            anchor["chat_name"] = chat_display_name
+                            anchor["local_id"] = int(local_id)
+                            anchor["ts"] = int(create_time)
+                            anchor["sender"] = sender_display
+
+                            asset_kind = asset.get("kind")
+                            if asset_kind in ("image", "video"):
+                                media_obj = wx_contract.build_media_object(
+                                    asset=asset,
+                                    kind=asset_kind,
+                                    anchor=anchor,
+                                    ocr_mode=ocr_mode,
                                 )
-                                anchor["chat_id"] = chat_id
-                                anchor["chat_name"] = chat_display_name
-                                anchor["local_id"] = int(local_id)
-                                anchor["ts"] = int(create_time)
-                                anchor["sender"] = sender_display
-
-                                ocr_raw = dict(asset.get("ocr") or {})
-                                ocr_data = {
-                                    "status": ocr_raw.get("status", "skipped"),
-                                    "text": ocr_raw.get("text", ""),
-                                    "provider": ocr_raw.get("provider", "none"),
-                                    "confidence": ocr_raw.get("confidence"),
-                                }
-                                if "lang" in ocr_raw:
-                                    ocr_data["lang"] = ocr_raw["lang"]
-                                if "version" in ocr_raw:
-                                    ocr_data["version"] = ocr_raw["version"]
-                                if "sha256" in ocr_raw:
-                                    ocr_data["sha256"] = ocr_raw["sha256"]
-
-                                media_obj = {
-                                    "asset_id": asset["asset_id"],
-                                    "kind": "image",
-                                    "quality": asset.get("quality", "full"),
-                                    "format": asset.get("format", "jpg"),
-                                    "width": asset.get("width"),
-                                    "height": asset.get("height"),
-                                    "bytes": int(asset.get("bytes") or 0),
-                                    "path": (
-                                        asset.get("path")
-                                        or f"media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
-                                    ),
-                                    "url": (
-                                        asset.get("url")
-                                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
-                                    ),
-                                    "anchor": anchor,
-                                    "source": asset.get("source") or {"dat": "", "variant": ""},
-                                    "ocr": ocr_data,
-                                }
-                                # 契约 v1.2 修正版：text 为 ocr.text 的截断投影（<=2000字）；若 empty/failed 则为空串
-                                th = asset.get("text_head")
-                                if th is None and ocr_data.get("status") == "ready" and ocr_data.get("text"):
-                                    raw_t = str(ocr_data["text"]).strip()
-                                    th = (raw_t[:2000] + "…") if len(raw_t) > 2000 else raw_t
-                                text = str(th or "")
+                                if asset_kind == "image":
+                                    if ocr_mode == "none":
+                                        text = ""
+                                    else:
+                                        text = wx_contract.ocr_projection(asset, max_chars=2000)
                             else:
                                 if media.get("inject_into_text"):
                                     head = str(asset.get("text_head") or "")[: media["max_chars"]]
@@ -778,7 +747,15 @@ def export_wechat_data(
                                 if create_time > now_epoch - media["pending_window"]:
                                     if hold_epoch is None or create_time < hold_epoch:
                                         hold_epoch = create_time
-
+                        elif (kind == "video" and media.get("video")
+                                and chat_id in media["allow_chats"]):
+                            settled = (
+                                asset and asset.get("state") in ("ready", "skipped", "failed")
+                            )
+                            if not settled:
+                                if create_time > now_epoch - media["pending_window"]:
+                                    if hold_epoch is None or create_time < hold_epoch:
+                                        hold_epoch = create_time
                     ts_str = format_rfc3339(create_time)
                     if create_time > max_message_time:
                         max_message_time = create_time
@@ -817,6 +794,21 @@ def export_wechat_data(
     watermark_str = format_rfc3339(watermark_epoch)
 
     now_epoch = time.time()
+    media_included_count = 0
+    ocr_chars_count = 0
+    for c in chats_list:
+        for m in c.get("messages", []):
+            m_obj = m.get("media")
+            if m_obj is not None:
+                media_included_count += 1
+            if ocr_mode == "full":
+                ocr_info = m_obj.get("ocr") if m_obj else None
+                if isinstance(ocr_info, dict) and ocr_info.get("text"):
+                    ocr_chars_count += len(str(ocr_info["text"]))
+            elif ocr_mode == "head":
+                if m.get("kind") == "image" and m.get("text"):
+                    ocr_chars_count += len(str(m["text"]))
+
     response_payload = {
         "exported_at": format_rfc3339(now_epoch),
         "range": {
@@ -828,6 +820,11 @@ def export_wechat_data(
         "manifest": {
             "sha256": manifest_sha256,
             "message_count": total_message_count,
+        },
+        "payload_stats": {
+            "messages": total_message_count,
+            "media_included": media_included_count,
+            "ocr_chars": ocr_chars_count if ocr_mode != "none" else 0,
         },
     }
     return response_payload
@@ -914,6 +911,33 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             since_val = query.get("since", [None])[0]
             to_val = query.get("to", [None])[0]
 
+            media_param = query.get("media", ["all"])[0]
+            if media_param not in ("none", "image", "video", "all"):
+                self.send_json(400, {
+                    "error": {
+                        "code": "invalid_param",
+                        "message": f"Invalid media parameter: {media_param!r}",
+                        "hint": "media ∈ none|image|video|all",
+                    }
+                })
+                return
+
+            ocr_param = query.get("ocr", ["head"])[0]
+            if ocr_param not in ("none", "head", "full"):
+                self.send_json(400, {
+                    "error": {
+                        "code": "invalid_param",
+                        "message": f"Invalid ocr parameter: {ocr_param!r}",
+                        "hint": "ocr ∈ none|head|full",
+                    }
+                })
+                return
+
+            media_chats_val = query.get("media_chats", [None])[0]
+            media_chats_set: set[str] | None = None
+            if media_chats_val is not None:
+                media_chats_set = {c.strip() for c in media_chats_val.split(",") if c.strip()}
+
             try:
                 since_epoch = parse_time_param(since_val, default_epoch=now - 86400.0)
                 to_epoch = parse_time_param(to_val, default_epoch=now)
@@ -937,6 +961,9 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     allowlist=allowlist,
                     blocklist=blocklist,
                     server_context=self.server_context,
+                    media_filter=media_param,
+                    media_chats=media_chats_set,
+                    ocr_mode=ocr_param,
                 )
                 self.send_json(200, result)
             except Exception as e:
@@ -953,6 +980,10 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             since_val = query.get("since", [None])[0]
             until_val = query.get("until", [None])[0]
             quality = query.get("quality", [""])[0].strip()
+            kind_val = query.get("kind", ["image,video"])[0].strip()
+            target_kinds = {k.strip() for k in kind_val.split(",") if k.strip()}
+            if not target_kinds:
+                target_kinds = {"image", "video"}
             include_val = query.get("include", [""])[0].strip()
             include_context = "context" in [x.strip() for x in include_val.split(",") if x.strip()]
 
@@ -996,7 +1027,10 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             for mkey, aid in by_message.items():
                 seen_instances.add(mkey)
                 asset = assets.get(aid or "")
-                if not asset or asset.get("kind") != "image" or asset.get("state") != "ready":
+                if not asset or asset.get("state") != "ready":
+                    continue
+                akind = asset.get("kind")
+                if akind not in target_kinds:
                     continue
                 anchor = dict(anchors_map.get(mkey) or asset.get("anchor") or {})
                 m_chat = anchor.get("chat_id") or (mkey.split("|")[0] if "|" in mkey else "")
@@ -1027,24 +1061,35 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 anchor.setdefault("ts", ts)
                 anchor.setdefault("sender", "我")
 
-                item = {
-                    "asset_id": asset["asset_id"],
+                aid = asset.get("md5") or asset.get("asset_id") or ""
+                fmt = asset.get("format", "jpg" if akind == "image" else "mp4")
+                item: dict[str, Any] = {
+                    "asset_id": aid,
                     "anchor": anchor,
-                    "quality": asset.get("quality", "full"),
-                    "format": asset.get("format", "jpg"),
+                    "format": fmt,
                     "width": asset.get("width"),
                     "height": asset.get("height"),
                     "bytes": int(asset.get("bytes") or 0),
-                    "ocr": ocr_dict,
                     "url": (
                         asset.get("url")
-                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                        or f"/api/wechat/media/{aid}/{akind}.{fmt}"
                     ),
                 }
+                if akind == "image":
+                    item["quality"] = asset.get("quality", "full")
+                    item["ocr"] = ocr_dict
+                elif akind == "video":
+                    item["duration_s"] = asset.get("duration_s")
+                    item["poster"] = (
+                        asset.get("poster")
+                        or (f"/api/wechat/media/{aid}/thumb.jpg" if asset.get("thumb") else None)
+                    )
                 matches.append(item)
-
             for aid, asset in assets.items():
-                if asset.get("kind") != "image" or asset.get("state") != "ready":
+                if not asset or asset.get("state") != "ready":
+                    continue
+                akind = asset.get("kind")
+                if akind not in target_kinds:
                     continue
                 anchor = dict(asset.get("anchor") or {})
                 m_chat = anchor.get("chat_id", "")
@@ -1071,20 +1116,29 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
 
                 anchor["chat_id"] = m_chat
                 anchor["chat_name"] = resolve_chat_name(m_chat, vault_dir, contacts)
+                aid = asset.get("md5") or asset.get("asset_id") or ""
+                fmt = asset.get("format", "jpg" if akind == "image" else "mp4")
                 item = {
-                    "asset_id": asset["asset_id"],
+                    "asset_id": aid,
                     "anchor": anchor,
-                    "quality": asset.get("quality", "full"),
-                    "format": asset.get("format", "jpg"),
+                    "format": fmt,
                     "width": asset.get("width"),
                     "height": asset.get("height"),
                     "bytes": int(asset.get("bytes") or 0),
-                    "ocr": ocr_dict,
                     "url": (
                         asset.get("url")
-                        or f"/api/wechat/media/{asset['asset_id']}/image.{asset.get('format', 'jpg')}"
+                        or f"/api/wechat/media/{aid}/{akind}.{fmt}"
                     ),
                 }
+                if akind == "image":
+                    item["quality"] = asset.get("quality", "full")
+                    item["ocr"] = ocr_dict
+                elif akind == "video":
+                    item["duration_s"] = asset.get("duration_s")
+                    item["poster"] = (
+                        asset.get("poster")
+                        or (f"/api/wechat/media/{aid}/thumb.jpg" if asset.get("thumb") else None)
+                    )
                 matches.append(item)
 
             matches.sort(
@@ -1126,7 +1180,7 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             filename = m_media_file.group(2)
 
             ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            if ext not in ALLOWED_IMAGE_EXTS or not re.fullmatch(r"^[a-zA-Z0-9_.-]+$", filename):
+            if ext not in ALLOWED_MEDIA_EXTS or not re.fullmatch(r"^[a-zA-Z0-9_.-]+$", filename):
                 self.send_json(400, {"error": "Invalid filename or extension"})
                 return
 
@@ -1180,12 +1234,11 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 if asset_dir.is_dir():
                     cands = [
                         p for p in asset_dir.iterdir()
-                        if p.is_file() and p.suffix.lstrip(".").lower() in ALLOWED_IMAGE_EXTS
+                        if p.is_file() and p.suffix.lstrip(".").lower() in ALLOWED_MEDIA_EXTS
                     ]
                     if cands:
                         target_path = cands[0]
                         ext = target_path.suffix.lstrip(".").lower()
-
             if not target_path.is_file():
                 self.send_json(404, {"error": "Not Found"})
                 return
@@ -1223,12 +1276,66 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 "png": "image/png",
                 "gif": "image/gif",
                 "webp": "image/webp",
+                "mp4": "video/mp4",
+                "mov": "video/quicktime",
             }
             ct = content_types.get(ext, "application/octet-stream")
+            file_size = len(data)
+
+            # Range support
+            range_header = self.headers.get("Range", "").strip()
+            m_range = re.fullmatch(r"^bytes=(\d*)-(\d*)$", range_header) if range_header else None
+            is_video = ext in ("mp4", "mov")
+            if m_range and file_size > 0:
+                start_str, end_str = m_range.group(1), m_range.group(2)
+                if not start_str and not end_str:
+                    # Invalid range -> fallback to 200
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", str(file_size))
+                    if is_video:
+                        self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("ETag", etag_header)
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if not start_str:
+                    # suffix bytes: bytes=-500
+                    suffix_len = int(end_str)
+                    start = max(0, file_size - suffix_len)
+                    end = file_size - 1
+                elif not end_str:
+                    # bytes=500-
+                    start = int(start_str)
+                    end = file_size - 1
+                else:
+                    start = int(start_str)
+                    end = int(end_str)
+
+                if start > end or start >= file_size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+
+                end = min(end, file_size - 1)
+                part = data[start: end + 1]
+                self.send_response(206)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(len(part)))
+                if is_video:
+                    self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", etag_header)
+                self.end_headers()
+                self.wfile.write(part)
+                return
 
             self.send_response(200)
             self.send_header("Content-Type", ct)
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(file_size))
+            if is_video:
+                self.send_header("Accept-Ranges", "bytes")
             self.send_header("ETag", etag_header)
             self.end_headers()
             self.wfile.write(data)

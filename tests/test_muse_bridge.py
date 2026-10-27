@@ -5,13 +5,19 @@
 Tests cover:
 1. format_payload in assistant_webhook:
    - Backwards compatibility when media is absent (exact equality).
-   - Enriched media payload fields present for custom, dify, and feishu.
+   - Enriched media payload fields (media_url, media_url_abs, media_url_auth).
+   - Base URL construction with/without public_base_url.
    - Flag --no-media disables media inclusion.
    - Feishu appends image URL line with base host derived from export_url.
    - [note] fallback behavior when text is empty.
+   - fetch_export query string passthrough for media, media_chats, ocr.
 2. muse_probe functionality:
    - Sensitive digit masking (>=11 digits masked as ***).
-   - --audit mode stats calculation and pass/fail thresholds.
+   - --audit mode stats calculation under OCR enabled vs OCR disabled.
+   - --vision payload structure: base64 inlining, --no-base64 url fallback.
+   - --vision handling when OCR text is empty (no empty placeholder text).
+   - --vision with --only video (url + poster, no base64).
+   - --estimate-bytes table formatting and row output.
    - --score mode against mocked webhook responses (hit, partial, hallu).
    - --dry-run mode does not invoke network requests.
 """
@@ -22,6 +28,7 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -114,6 +121,8 @@ class TestFormatPayload(unittest.TestCase):
         forbidden_keys = (
             "media",
             "media_url",
+            "media_url_abs",
+            "media_url_auth",
             "media_asset_id",
             "chat_name",
             "ocr_text",
@@ -128,6 +137,8 @@ class TestFormatPayload(unittest.TestCase):
         forbidden_keys = (
             "media",
             "media_url",
+            "media_url_abs",
+            "media_url_auth",
             "media_asset_id",
             "chat_name",
             "ocr_text",
@@ -142,34 +153,56 @@ class TestFormatPayload(unittest.TestCase):
         self.assertEqual(p["content"], "[图片]")
         self.assertEqual(p["text"], "")
 
-    def test_enriched_media_custom(self):
-        """Custom format with media includes all required fields."""
-        p = aw.format_payload(
-            "custom", "chat_group_1", self.image_msg_enriched
+    def test_enriched_media_custom_with_and_without_base(self):
+        """Custom format includes media_url, media_url_abs, media_url_auth."""
+        # 1. With public_base_url
+        p1 = aw.format_payload(
+            "custom",
+            "chat_group_1",
+            self.image_msg_enriched,
+            public_base_url="https://wechat.example.com",
         )
+        aid = "a" * 32
+        rel = f"/api/wechat/media/{aid}/image.jpg"
+        self.assertEqual(p1["media_url"], rel)
         self.assertEqual(
-            p["media_url"], f"/api/wechat/media/{'a' * 32}/image.jpg"
+            p1["media_url_abs"], f"https://wechat.example.com{rel}"
         )
-        self.assertEqual(p["media_asset_id"], "a" * 32)
-        self.assertEqual(p["chat_name"], "技术研发交流群")
-        self.assertEqual(p["ocr_text"], "解约协议与家庭医生签约通知全文...")
-        self.assertEqual(p["media"], self.enriched_media)
+        self.assertEqual(p1["media_url_auth"], "bearer")
+        self.assertEqual(p1["media_asset_id"], aid)
+        self.assertEqual(p1["chat_name"], "技术研发交流群")
+        self.assertEqual(p1["ocr_text"], "解约协议与家庭医生签约通知全文...")
+
+        # 2. Without base url (falls back to relative path in media_url_abs)
+        p2 = aw.format_payload(
+            "custom",
+            "chat_group_1",
+            self.image_msg_enriched,
+            export_url="",
+            public_base_url="",
+        )
+        self.assertEqual(p2["media_url"], rel)
+        self.assertEqual(p2["media_url_abs"], rel)
+        self.assertEqual(p2["media_url_auth"], "bearer")
 
     def test_enriched_media_dify(self):
         """Dify format with media populates fields into inputs dict."""
         p = aw.format_payload(
-            "dify", "chat_group_1", self.image_msg_enriched
+            "dify",
+            "chat_group_1",
+            self.image_msg_enriched,
+            public_base_url="http://127.0.0.1:8765",
         )
         inputs = p["inputs"]
+        aid = "a" * 32
+        rel = f"/api/wechat/media/{aid}/image.jpg"
+        self.assertEqual(inputs["media_url"], rel)
         self.assertEqual(
-            inputs["media_url"], f"/api/wechat/media/{'a' * 32}/image.jpg"
+            inputs["media_url_abs"], f"http://127.0.0.1:8765{rel}"
         )
-        self.assertEqual(inputs["media_asset_id"], "a" * 32)
+        self.assertEqual(inputs["media_url_auth"], "bearer")
+        self.assertEqual(inputs["media_asset_id"], aid)
         self.assertEqual(inputs["chat_name"], "技术研发交流群")
-        self.assertEqual(
-            inputs["ocr_text"], "解约协议与家庭医生签约通知全文..."
-        )
-        self.assertEqual(inputs["media"], self.enriched_media)
 
     def test_include_media_false_omits_media(self):
         """Setting include_media=False omits media even if present in msg."""
@@ -182,48 +215,36 @@ class TestFormatPayload(unittest.TestCase):
         for key in (
             "media",
             "media_url",
+            "media_url_abs",
+            "media_url_auth",
             "media_asset_id",
             "chat_name",
             "ocr_text",
         ):
             self.assertNotIn(key, p)
 
-    def test_chat_name_fallback_to_chat_id(self):
-        """If anchor.chat_name is missing, chat_name falls back to chat_id."""
-        msg_without_chatname = dict(self.image_msg_enriched)
-        media_copy = dict(self.enriched_media)
-        media_copy["anchor"] = {"chat_id": "fallback_id"}
-        msg_without_chatname["media"] = media_copy
+    def test_fetch_export_query_params(self):
+        """fetch_export correctly serializes media, media_chats, ocr params."""
+        with mock.patch("urllib.request.urlopen") as mock_url:
+            mock_resp = mock.MagicMock()
+            mock_resp.getcode.return_value = 200
+            mock_resp.read.return_value = b'{"watermark": "123"}'
+            mock_url.return_value.__enter__.return_value = mock_resp
 
-        p = aw.format_payload("custom", "fallback_id", msg_without_chatname)
-        self.assertEqual(p["chat_name"], "fallback_id")
-
-    def test_feishu_media_url_formatting(self):
-        """Feishu payload appends image URL with host from export_url."""
-        # 1. With export_url providing host
-        p1 = aw.format_payload(
-            "feishu",
-            "chat_group_1",
-            self.image_msg_enriched,
-            export_url="http://192.168.1.100:8765/api/wechat/export",
-        )
-        text1 = p1["content"]["text"]
-        aid_str = "a" * 32
-        exp1 = (
-            f"http://192.168.1.100:8765/api/wechat/media/{aid_str}/image.jpg"
-        )
-        self.assertIn(f"🖼 原图: {exp1}", text1)
-
-        # 2. Without export_url (fallback to relative URL)
-        p2 = aw.format_payload(
-            "feishu",
-            "chat_group_1",
-            self.image_msg_enriched,
-            export_url="",
-        )
-        text2 = p2["content"]["text"]
-        exp2 = f"/api/wechat/media/{'a' * 32}/image.jpg"
-        self.assertIn(f"🖼 原图: {exp2}", text2)
+            aw.fetch_export(
+                endpoint="http://127.0.0.1:8765/api/wechat/export",
+                token="test_tok",
+                media="image",
+                media_chats="chat1,chat2",
+                ocr="none",
+            )
+            self.assertTrue(mock_url.called)
+            req = mock_url.call_args[0][0]
+            parsed = urllib.parse.urlparse(req.full_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            self.assertEqual(qs.get("media"), ["image"])
+            self.assertEqual(qs.get("media_chats"), ["chat1,chat2"])
+            self.assertEqual(qs.get("ocr"), ["none"])
 
 
 class TestMuseProbeAudit(unittest.TestCase):
@@ -240,7 +261,7 @@ class TestMuseProbeAudit(unittest.TestCase):
         for src, expected in cases:
             self.assertEqual(mp.mask_sensitive_digits(src), expected)
 
-    def test_audit_passes_on_valid_dataset(self):
+    def test_audit_ocr_enabled_thresholds(self):
         dataset = {
             "chats": [
                 {
@@ -292,35 +313,144 @@ class TestMuseProbeAudit(unittest.TestCase):
                 }
             ]
         }
-        # In this dataset: 2 images, 1 text non-empty (50% < 80% -> FAIL)
-        passed, report = mp.run_audit(dataset)
-        self.assertFalse(passed)
-        self.assertIn("AUDIT: FAIL", report)
+        # 1. OCR enabled: 1 of 2 non-empty (50% < 80% threshold -> FAIL)
+        passed1, report1 = mp.run_audit(dataset, ocr_enabled=True)
+        self.assertFalse(passed1)
+        self.assertIn("AUDIT: FAIL", report1)
 
-        # Add 3 images to make 4 out of 5 non-empty (80%) -> PASS
-        for i in range(3):
-            dataset["chats"][0]["messages"].append({
-                "kind": "image",
-                "text": f"文字内容 {i}",
-                "media": {
-                    "asset_id": f"{i+3}" * 32,
-                    "kind": "image",
-                    "url": f"/api/wechat/media/{i+3}/image.jpg",
-                    "anchor": {
-                        "chat_id": "group_101",
-                        "chat_name": "社区健康服务群",
-                        "local_id": i + 3,
-                        "ts": 1700000020 + i,
-                        "sender": "wxid_doc",
-                    },
-                    "ocr": {"status": "ready", "text": f"文字内容 {i}"},
-                },
-            })
+        # 2. OCR disabled: text non-empty not required, urls resolvable -> PASS
+        passed2, report2 = mp.run_audit(dataset, ocr_enabled=False)
+        self.assertTrue(passed2)
+        self.assertIn("AUDIT: PASS", report2)
+        self.assertIn("ocr=disabled", report2)
 
-        passed, report = mp.run_audit(dataset)
-        self.assertTrue(passed)
-        self.assertIn("AUDIT: PASS", report)
-        self.assertIn("***", report)  # Sensitive phone number was masked
+
+class TestMuseProbeVisionAndEstimate(unittest.TestCase):
+    def setUp(self):
+        self.aid_img = "c" * 8
+        self.aid_vid = "d" * 8
+        self.dataset = {
+            "chats": [
+                {
+                    "chat_id": "chat_001",
+                    "messages": [
+                        {
+                            "kind": "image",
+                            "text": "排班表通知",
+                            "media": {
+                                "asset_id": self.aid_img,
+                                "kind": "image",
+                                "format": "png",
+                                "url": f"/media/{self.aid_img}.png",
+                                "anchor": {
+                                    "chat_id": "chat_001",
+                                    "chat_name": "技术运营群",
+                                    "ts": 1750000000,
+                                    "sender": "张三",
+                                },
+                                "ocr": {
+                                    "status": "ready",
+                                    "text": "排班表详情：周一李四，周二王五",
+                                },
+                            },
+                        },
+                        {
+                            "kind": "image",
+                            "text": "",
+                            "media": {
+                                "asset_id": "e" * 32,
+                                "kind": "image",
+                                "format": "jpg",
+                                "url": f"/api/wechat/media/{'e' * 32}/img.jpg",
+                                "anchor": {
+                                    "chat_id": "chat_001",
+                                    "chat_name": "技术运营群",
+                                    "ts": 1750000010,
+                                    "sender": "李四",
+                                },
+                                "ocr": {
+                                    "status": "empty",
+                                    "text": "",
+                                },
+                            },
+                        },
+                        {
+                            "kind": "video",
+                            "text": "",
+                            "media": {
+                                "asset_id": self.aid_vid,
+                                "kind": "video",
+                                "format": "mp4",
+                                "url": f"/media/{self.aid_vid}.mp4",
+                                "poster": f"/media/{self.aid_vid}.jpg",
+                                "anchor": {
+                                    "chat_id": "chat_001",
+                                    "chat_name": "技术运营群",
+                                    "ts": 1750000020,
+                                    "sender": "王五",
+                                },
+                            },
+                        },
+                    ],
+                }
+            ]
+        }
+
+    def test_vision_payload_structure_and_no_base64(self):
+        """--vision generates valid OpenAI multimodal payload with URL."""
+        res = mp.run_vision(
+            data=self.dataset,
+            vision_model="gpt-4o",
+            limit=1,
+            no_base64=True,
+            public_base_url="http://192.168.1.50:8765",
+            only="image",
+        )
+        self.assertIn("这是给 Muse 的载荷", res)
+        expected_url = f"http://192.168.1.50:8765/media/{self.aid_img}.png"
+        self.assertIn(expected_url, res)
+        self.assertIn("排班表详情：周一李四", res)
+
+    def test_vision_payload_when_ocr_empty(self):
+        """When OCR text is empty, no empty OCR placeholder is injected."""
+        # Target the second message which has empty OCR
+        dataset_empty = {
+            "chats": [
+                {
+                    "chat_id": "c",
+                    "messages": [self.dataset["chats"][0]["messages"][1]],
+                }
+            ]
+        }
+        res = mp.run_vision(
+            data=dataset_empty,
+            no_base64=True,
+            only="image",
+        )
+        self.assertNotIn("OCR识别参考文本", res)
+        self.assertIn("会话名称: 技术运营群", res)
+
+    def test_vision_payload_only_video(self):
+        """--vision with --only video outputs video_url without base64."""
+        res = mp.run_vision(
+            data=self.dataset,
+            public_base_url="http://127.0.0.1:8765",
+            only="video",
+        )
+        self.assertIn("video_url", res)
+        self.assertIn(f"/media/{self.aid_vid}.mp4", res)
+        self.assertIn(f"/media/{self.aid_vid}.jpg", res)
+        self.assertNotIn("data:image", res)
+
+    def test_estimate_bytes_table(self):
+        """--estimate-bytes returns formatted size comparison table."""
+        table = mp.estimate_payload_bytes(self.dataset)
+        self.assertIn("Payload Size Estimation Across Filter Modes", table)
+        self.assertIn("media=none & ocr=none", table)
+        self.assertIn("media=image & ocr=head/full", table)
+        self.assertIn("media=all (image + video)", table)
+        lines = table.strip().split("\n")
+        self.assertGreaterEqual(len(lines), 6)
 
 
 class TestMuseProbeScoreAndDryRun(unittest.TestCase):

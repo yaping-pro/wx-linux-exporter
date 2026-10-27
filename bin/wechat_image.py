@@ -41,10 +41,9 @@ SIG_BMP = b"BM"
 SIG_RIFF = b"RIFF"
 SIG_WEBP = b"WEBP"
 SIG_WXGF = b"wxgf"
+SIG_FTYP = b"ftyp"
 
-VALID_FORMATS = ("jpg", "png", "gif", "webp", "bmp", "wxgf")
-
-# Quality rankings
+VALID_FORMATS = ("jpg", "png", "gif", "webp", "bmp", "wxgf", "mp4", "mov")
 QUALITY_WEIGHTS = {
     "hd": 4,
     "full": 3,
@@ -165,6 +164,11 @@ def detect_format(head: bytes) -> str:
         return "webp"
     if head.startswith(SIG_WXGF):
         return "wxgf"
+    if len(head) >= 8 and head[4:8] == SIG_FTYP:
+        major = head[8:12] if len(head) >= 12 else b""
+        if major in (b"qt  ", b"moov"):
+            return "mov"
+        return "mp4"
     return "bin"
 
 
@@ -976,8 +980,75 @@ def image_size(data: bytes, fmt: str) -> tuple[int | None, int | None]:
         return _parse_webp_size(data)
     if fmt == "bmp":
         return _parse_bmp_size(data)
+    if fmt in ("mp4", "mov"):
+        return _parse_mp4_size(data)
 
     return None, None
+
+
+def _parse_mp4_size(data: bytes) -> tuple[int | None, int | None]:
+    """Parse width and height from MP4/MOV container moov->trak->tkhd boxes."""
+    w, h, _ = parse_mp4_metadata(data)
+    return w, h
+
+
+def parse_mp4_metadata(data: bytes) -> tuple[int | None, int | None, float | None]:
+    """Parse (width, height, duration_s) from MP4/MOV bytes without external tools."""
+    if not data or len(data) < 8:
+        return None, None, None
+    width, height = None, None
+    duration_s = None
+    l_data = len(data)
+
+    def parse_boxes(start: int, end: int) -> None:
+        nonlocal width, height, duration_s
+        pos = start
+        while pos + 8 <= end:
+            sz = struct.unpack(">I", data[pos:pos + 4])[0]
+            typ = data[pos + 4:pos + 8]
+            box_len = sz
+            hdr_len = 8
+            if sz == 1:
+                if pos + 16 > end:
+                    break
+                box_len = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+                hdr_len = 16
+            elif sz == 0:
+                box_len = end - pos
+            if box_len < hdr_len or pos + box_len > end:
+                break
+
+            b_start = pos + hdr_len
+            b_end = pos + box_len
+            if typ in (b"moov", b"trak", b"mdia", b"minf"):
+                parse_boxes(b_start, b_end)
+            elif typ == b"mvhd":
+                ver = data[b_start]
+                if ver == 0 and b_start + 20 <= b_end:
+                    ts = struct.unpack(">I", data[b_start + 12:b_start + 16])[0]
+                    dur = struct.unpack(">I", data[b_start + 16:b_start + 20])[0]
+                    if ts > 0 and duration_s is None:
+                        duration_s = round(dur / ts, 2)
+                elif ver == 1 and b_start + 32 <= b_end:
+                    ts = struct.unpack(">I", data[b_start + 20:b_start + 24])[0]
+                    dur = struct.unpack(">Q", data[b_start + 24:b_start + 32])[0]
+                    if ts > 0 and duration_s is None:
+                        duration_s = round(dur / ts, 2)
+            elif typ == b"tkhd":
+                if b_end - 8 >= b_start:
+                    w_fix = struct.unpack(">I", data[b_end - 8:b_end - 4])[0]
+                    h_fix = struct.unpack(">I", data[b_end - 4:b_end])[0]
+                    w = w_fix >> 16
+                    h = h_fix >> 16
+                    if w > 0 and h > 0 and width is None:
+                        width, height = w, h
+            pos += box_len
+
+    try:
+        parse_boxes(0, min(l_data, 1024 * 1024))
+    except Exception:
+        pass
+    return width, height, duration_s
 
 
 def _parse_png_size(data: bytes) -> tuple[int | None, int | None]:

@@ -935,7 +935,7 @@ class HttpApiEndpointsIntegrationTests(unittest.TestCase):
 
     def test_export_endpoint_injects_media_and_text_projection(self):
         """测试 /api/wechat/export 注入 media 字段，且 text 填入截断投影。"""
-        status, body, _ = self._req("/api/wechat/export?since=1759000000&to=1759000500")
+        status, body, _ = self._req("/api/wechat/export?since=1759000000&to=1759000500&ocr=full")
         self.assertEqual(status, 200)
         data = json.loads(body.decode("utf-8"))
 

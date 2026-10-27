@@ -15,8 +15,8 @@
 | :--- | :--- | :--- |
 | **文件附件**（pdf/docx/xlsx/pptx/html…） | MinerU 文档解析 | 是（MinerU；免 token 通道可用） |
 | **语音** | **微信客户端自带的语音转文字** | 否（纯读本地库） |
-| **图片** | **离线 AES+XOR 解密 + 本地 OCR** | 否（100% 离线推导与计算） |
-| 视频 | 不支持（未评估） | — |
+| **图片** | **离线 AES+XOR 解密 + 本地可选 OCR** | 否（100% 离线推导与计算；OCR 完全可选） |
+| **视频** | **明文 MP4 归档与缩略图关联** | 否（纯读本地库与磁盘；不做转码与 ASR） |
 ---
 
 ## 2. 架构
@@ -128,6 +128,38 @@ appmsg(<type>6</type>).<md5>  →  hardlink.db : file_hardlink_info_v4.md5
 
 ---
 
+## 5.1. 视频与图片：媒体落盘与可选 OCR 兜底
+
+### 视频（local_type=43）
+- **策略开关**：
+  ```json
+  "kinds": {"video": true},
+  "video": {
+    "max_bytes": 524288000,
+    "copy_mode": "copy",
+    "keep_thumb": true
+  }
+  ```
+- **定位与落盘**：
+  - 优先从 `hardlink.db` 检索 `video_hardlink_info_v4`，退回 `msg/video` 与 `msg/attach` 目录启发式探测。
+  - 明文 MP4（偏移 4 起为 `ftyp`）直接按 `video.copy_mode`（copy 或 hardlink）落盘到 `exports/media/<date>/<md5>/video.mp4`；同 md5 缩略图（若存在）解密后保存为 `thumb.jpg`。
+  - **跳过态（不报错、终态记录）**：
+    - `missing_source`：视频文件在磁盘上不存在（未在客户端点击下载）。
+    - `oversize`：超过 `video.max_bytes`（默认 500MB）。
+    - `ext_denied`：扩展名被排除。
+    - `encrypted_video_unverified`：视频为加密 `.dat` 容器（尚未实测验证视频解密完整性）。
+- **边界**：不做转码、不做 ASR。
+
+### 图片 OCR 完全可选（两种部署模式）
+OCR 在图片富化链路中作为**可选兜底**，绝不阻碍图片正常落盘：
+1. **只投递媒体模式**（`image.ocr.enabled: false`）：
+   - 图片仍完成解密、变体择优与落盘。
+   - ledger 中 `ocr.status = "skipped"`，不报错、不重试、不发起任何 OCR 计算。
+2. **本地 OCR 模式**（`image.ocr.enabled: true`）：
+   - 优先加载本地 RapidOCR / Tesseract。
+   - 若系统缺失 OCR 依赖或执行异常，自动降级为 `ocr.status = "unavailable"` 或 `"failed"`，图片文件与 ledger 依然正常就绪（`state: "ready"`）。
+---
+
 ## 6. MinerU 凭据（可选）
 
 只有需要 precise 通道时才配。三种方式，按优先级：
@@ -192,10 +224,10 @@ from collections import Counter;print(Counter(v['state'] for v in d['assets'].va
 | `decrypt_failed` | dat 头损坏或密钥不匹配 | 可重试有限次，重试耗尽后落 failed 终态 | `图片（解析失败）` |
 | `max_pixels_exceeded` | 超过最大像素阈值（防解压炸弹） | 默认 5000 万像素，可调整 `image.max_pixels` | `图片（超大）` |
 | `skipped:animated` | wxgf 多帧动图 | 按策略 `wxgf.animated="skip"` 跳过 | `图片（动图）` |
+| `encrypted_video_unverified` | 视频为加密 .dat 容器，尚未验证解密完整性 | 保持跳过态，等待解密链路实测验证 | `视频（未解密）` |
 | `voice_not_transcribed` | 语音未转写且已过等待窗口 | 在客户端开启自动转写 / 手动转写 | `语音` |
 | `no_credential` | 需要 precise 但未配 token | 见 §6 | `卡片/链接/文件` |
 | `deduped` | 同内容已解析过 | 正常，零成本 | `图片` / 原 `note` |
----
 
 ## 8. 安全与隐私
 
@@ -213,7 +245,7 @@ from collections import Counter;print(Counter(v['state'] for v in d['assets'].va
 | 限制 / 现状 | 说明 |
 | :--- | :--- |
 | 图片（type 3）解密实测与支持 | 18,402/18,402 全部 V2 三段式、kvcomm 离线推导（AES-128-ECB + 单字节 XOR，xor_key=0x0C）、格式分布 jpg 80.65% / wxgf 11.75% / png 7.60%、画质可及性 hd 16.07% / full 29.42% / 仅缩略图 54.51%、明文 Thumb 兜底覆盖率仅 1.5%–11% 不可行。现已支持离线解密、变体择优（_h > full > _t > _b）与本地 OCR 富化，结构化附加至 `media` 字段，同时以 `text_head`（≤2000 字符截断投影）注入既有 `text` 字段以无缝兼容存量下游 |
-| 视频不支持 | 未评估 |
+| 视频（type 43）支持 | 支持明文 MP4 定位（优先 hardlink.db，退回目录探测）、落盘 `exports/media/<date>/<md5>/video.mp4` 与缩略图 `thumb.jpg`。加密 .dat 保持 `encrypted_video_unverified` 跳过态，不做转码、不做 ASR |
 | 历史语音不回溯 | 见 §5 |
 | 覆盖率受限于"微信是否已下载" | 文件是**点击才下载**；headless 客户端不会自动落盘所有附件，因此 `missing_source` 属正常现象 |
 | `hardlink.db` 表结构随微信版本变化 | 升级微信后需回归验证 `file_hardlink_info_v4` |

@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 ### Added
+- **三个正交过滤开关 + 视频注入 + 体积统计（契约 v1.3.0）**：
+  - **三个正交查询开关（`/api/wechat/export`）**：
+    - `media ∈ none|image|video|all`（默认 `all`）：按需控制媒体对象注入，未选中媒体消息保留 `note`（「图片」「视频」），消费端可按需事后拉取；
+    - `media_chats`（逗号分隔 chat_id，默认全选）：仅指定会话注入 `media`，其余会话优雅降级为 `note`；
+    - `ocr ∈ none|head|full`（默认 `head`）：`none` 彻底移除 OCR 与投影，`head` 仅 `text` 投影，`full` 保留 `text` 投影与 `media.ocr.text` 全文。
+    - 针对新增参数引入结构化错误响应 `400 {"error":{"code":"invalid_param","message":"...","hint":"..."}}`，保持既有错误响应形态不变。
+  - **视频富化注入与媒体服务扩展**：
+    - 就绪视频消息注入结构化 `media` 对象（含 `asset_id`、`duration_s`、`poster`、`format`、`bytes`、`width`、`height`、`anchor`、`source`）；
+    - `media_note(asset, kind)` 泛化：统一处理图片与视频未就绪/跳过状态映射（`视频（处理中）`、`视频（未下载）`、`视频（超大）`、`视频（解析失败）`）；
+    - `ALLOWED_IMAGE_EXTS` 重命名为 `ALLOWED_MEDIA_EXTS`，扩展支持 `mp4` 与 `mov`；媒体端点支持视频 `video/mp4` MIME 与 HTTP `Range`（206 Partial Content / `Content-Range`）断点续传播放；
+    - `GET /api/wechat/media` 增加 `kind` 筛选（支持 `image`、`video` 或 `image,video`，默认两者），返回结果携带 `duration_s` 与 `poster`。
+  - **Payload 体积统计**：导出响应根新增 `payload_stats: {"messages": N, "media_included": N, "ocr_chars": N}`，`ocr=none` 时 `ocr_chars` 强制为 0。
+  - `schema/export.schema.json`：同步更新 `mediaItem`（新增 `video` kind、`mp4`/`mov` format、`duration_s`、`poster`）与根对象 `payload_stats`。
+  - `docs/DATA_CONTRACT.md`：升级至 v1.3.0 规范，详细描述三个开关语义、视频媒体形状、payload_stats 统计与严格向后兼容性声明。
+  - `tests/test_media_filters.py`：新增测试套件，全面覆盖非法参数 400 结构、正交过滤开关、视频 media 形状、media_note 映射、Range 206 分片响应与 `payload_stats` 计数准确性。
 - **图片离线解密与 OCR 富化接入（契约 v1.2.0）**：
   - `bin/wechat_media.py`：新增图片消息（`local_type=3`）解析流。通过 `hardlink.db`（`image_hardlink_info_v4`）与磁盘模式探测定位 `.dat` 变体，支持变体画质择优（`_h > full > _t > _b`）、wxgf 动图策略过滤、惰性解密器与本地 OCR 协同、防解压炸弹像素闸、双目录物化（`exports/media/<date>/<asset_id>/` 与 `vault/media/<asset_id>/`）以及基于内容哈希的跨会话幂等复用。
   - `bin/wechat_export_api.py`：

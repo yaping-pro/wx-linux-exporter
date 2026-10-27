@@ -1,8 +1,37 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.2.0` (2026-10-27)
+> **版本**：`v1.3.0` (2026-10-27)
 
-> ## ⚠️ v1.2 语义扩充（新增结构化「媒体对象」与检索端点）
+> ## ⚠️ v1.3 语义扩充（三个正交过滤开关 + 视频注入 + 体积统计）
+>
+> 自 v1.3.0 起，新增三个正交查询开关、视频富化注入与响应根体积统计 `payload_stats`，默认值严格向后兼容 v1.2：
+>
+> | 参数 | 取值 | 默认 | 语义与消费端指引 |
+> | :--- | :--- | :--- | :--- |
+> | `media` | `none` \| `image` \| `video` \| `all` | `all` | 只对选中 kind 注入 `media` 对象；未选中的媒体消息**保留 `note`**（「图片」「视频」），消费端可事后用 `/api/wechat/media?q=` 按需取 |
+> | `media_chats` | 逗号分隔 chat_id | 空（全部允许会话） | 仅这些会话注入 `media`，其余会话的媒体消息退化为 `note` |
+> | `ocr` | `none` \| `head` \| `full` | `head` | `none`：不注入 `ocr` 对象且 `text` 不含 OCR；`head`：仅 `text` 带 ≤2000 字符投影；`full`：`text` 投影 + `media.ocr.text` 全文 |
+>
+> **视频富化注入（media 对象）**：
+> ```json
+> {
+>   "asset_id": "<32hex>", "kind": "video", "url": "/api/wechat/media/<id>/video.mp4",
+>   "poster": "/api/wechat/media/<id>/thumb.jpg", "duration_s": 12, "format": "mp4",
+>   "bytes": 123456, "width": 1080, "height": 1920,
+>   "anchor": {"chat_id": "...", "chat_name": "...", "local_id": 123, "ts": 1759123456, "sender": "..."},
+>   "source": "hardlink"
+> }
+> ```
+> **体积统计（根 payload_stats 字段）**：
+> ```json
+> "payload_stats": {"messages": 123, "media_included": 45, "ocr_chars": 6789}
+> ```
+> `ocr=none` 时 `ocr_chars` 必须为 0。
+>
+> **向后兼容性声明**：
+> 当缺省请求参数（或传入 `media=all&ocr=head`）时，既有导出结构与内容完全保持向后兼容。
+>
+> ## ⚠️ v1.2 历史语义扩充（新增结构化「媒体对象」与检索端点）
 >
 > 自 v1.2.0 起，本契约在保留 v1.1 基础的同时，为富化就绪的图片消息引入可选的结构化 `media` 字段及配套的媒体检索/获取端点：
 >
@@ -12,17 +41,16 @@
 > | 2 | **`text` 作为 OCR 文本的截断投影** | 当图片媒体富化就绪时，`text` 填入 `media.ocr.text` 的截断投影（≤2000 字符，超出加 `…`），以无缝兼容仅读取 `text` 的既有消费端；未就绪或无文字时保持空字符串。单一事实来源仍为 ledger 与 `media.ocr.text`。 |
 > | 3 | **`anchor` 定位与 `chat_name`** | 每条消息自带独立的 `anchor`（含 `chat_id`, `chat_name`, `local_id`, `ts`, `sender`），作为回到原会话的唯一凭据；`chat_name` 优先取解密备注名/群名，未命中则回退 `chat_id`。 |
 > | 4 | **单调游标与终态保证** | watermark 保持单调推进；仅未就绪且在等待窗口内的临时状态挂起水位，终态（ready/skipped/failed）绝不阻滞水位。 |
-> | 5 | **图片 `note` 状态细化** | 未就绪或跳过的图片消息按原因细化 `note`：`图片（处理中）`、`图片（未下载）`、`图片（动图）`、`图片（超大）`、`图片（不可解密）`、`图片（解析失败）`、`图片（无法定位）`；富化就绪或未启用时保持 `图片`。消费端可一眼区分无内容原因，绝不塞入错误详情或 OCR 文本。 |
+> | 5 | **媒体 `note` 状态细化** | 图片/视频未就绪或跳过时细化 `note`：`图片（处理中）`、`视频（处理中）`、`视频（未下载）`、`视频（超大）`、`视频（解析失败）`；就绪时分别为 `图片`、`视频`。 |
 >
 > **消费端读取最佳实践**：
 > - 文本检索与智能体阅读：优先读取 `media.ocr.text`。
-> - 原图展示与归档存储：使用 `media.url` 发起携带 Bearer Token 的 GET 请求获取原图二进制。
+> - 原图与视频展示：使用 `media.url` 发起携带 Bearer Token 的 GET 请求获取媒体二进制（视频支持 HTTP Range 206 断点播放）。
 > - 对话定位与上下文回溯：依据 `media.anchor` 确定会话位置，或直接在 `/api/wechat/media` 检索时附带 `include=context` 参数。
 > - **即用检索命令**（按关键词检索图片并内联紧邻上下文）：
 >   ```bash
 >   curl -s -H "Authorization: Bearer <TOKEN>" "http://<HOST>:8765/api/wechat/media?q=发票&include=context&limit=10" | jq .
 >   ```
->
 > ## ⚠️ v1.1 历史语义变更（语音与文件富化）
 >
 > 自 v1.1.0 起支持文件与语音富化：
@@ -84,10 +112,12 @@
 - **请求参数**：
   | 参数名 | 类型 | 必填 | 默认值 | 说明与示例 |
   | :--- | :--- | :--- | :--- | :--- |
-  | `since` | string/int | 否 | `now - 86400` (前推 24h) | 起始时间戳。支持 RFC3339 字符串（如 `2026-10-13T00:00:00+08:00`）或 Unix Epoch 秒（如 `1791849600`） |
+  | `since` | string/int | 否 | `now - 86400` (前推 24h) | 起始时间戳。支持 RFC3339 字符串或 Unix Epoch 秒 |
   | `to` | string/int | 否 | `now` (请求发起时刻) | 结束时间戳。支持 RFC3339 或 Unix Epoch 秒 |
+  | `media` | string | 否 | `all` | 媒体过滤：`none` \| `image` \| `video` \| `all` |
+  | `media_chats` | string | 否 | 空 (全选) | 逗号分隔的会话 ID，仅这些会话注入媒体对象 |
+  | `ocr` | string | 否 | `head` | OCR 投影开关：`none` \| `head` \| `full` |
   | `limit` | int | 否 | 500 (手机端可按需配置) | 保护性单次返回上限 |
-
 #### (3) `GET /api/health/briefing`
 - **功能**：返回家服每日巡检简报快照（`linux1` 09:00 生成、同时推送 Telegram/飞书的那份原文 + 结构化健康指标），供 AI 助手每日拉取监测。
 - **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`（与 `/api/wechat/export` 完全一致）。该端点不匿名开放。
@@ -123,6 +153,7 @@
   | :--- | :--- | :--- | :--- | :--- |
   | `q` | string | 否 | `""` | OCR 文本不区分大小写的子串匹配 |
   | `chat_id` | string | 否 | `""` | 精确匹配会话 ID（如 `xxx@chatroom` 或 `wxid_xxx`） |
+  | `kind` | string | 否 | `image,video` | 媒体类型过滤：`image` \| `video` \| `image,video` |
   | `since` | string/int | 否 | `0` | 起始时间（支持 RFC3339 或 Epoch 秒） |
   | `until` | string/int | 否 | 无穷大 | 截止时间（支持 RFC3339 或 Epoch 秒） |
   | `quality` | string | 否 | `""` | 画质过滤：`hd` / `full` / `thumb` / `bubble` |
@@ -184,15 +215,16 @@
 ```
 
 #### (5) `GET /api/wechat/media/<asset_id>/<filename>`
-- **功能**：原图二进制文件下载。
+- **功能**：媒体（图片 / 视频 / 缩略图）二进制文件下载。
 - **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`。
 - **安全防护**：
   - 必须断言通过 `resolve()` 后的文件路径严格位于 `vault/media/` 目录下（403 阻断路径穿越）。
   - `asset_id` 必须严格符合 `^[0-9a-f]{32}$`。
-  - `filename` 扩展名必须属于白名单（`jpg` / `jpeg` / `png` / `gif` / `webp`）。
+  - `filename` 扩展名必须属于白名单（`ALLOWED_MEDIA_EXTS`：`jpg` / `jpeg` / `png` / `gif` / `webp` / `mp4` / `mov`）。
   - 若该资源所属会话全部被 `blocklist` 屏蔽，拒绝访问（返回 404）。
-- **缓存语义**：响应头返回 `ETag: "<sha256>"`，支持请求头 `If-None-Match` 返回 `304 Not Modified`。
----
+- **缓存与流式语义**：
+  - 响应头返回 `ETag: "<sha256>"`，支持请求头 `If-None-Match` 返回 `304 Not Modified`。
+  - 支持 HTTP `Range` 头，支持播放器及 ffmpeg 206 Partial Content 分片拉取（返回 `Content-Range` 与 `Accept-Ranges: bytes`）。
 
 ## 3. 标准快照 Payload 规范 (Standard Snapshot Schema)
 

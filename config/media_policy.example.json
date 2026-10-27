@@ -7,6 +7,11 @@
     "voice": true,
     "video": false
   },
+  "video": {
+    "max_bytes": 524288000,
+    "copy_mode": "copy",
+    "keep_thumb": true
+  },
   "image": {
     "enabled": false,
     "quality_preference": ["hd", "full", "thumb", "bubble"],

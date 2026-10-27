@@ -68,6 +68,32 @@
         }
       },
       "additionalProperties": false
+    },
+    "payload_stats": {
+      "type": "object",
+      "required": [
+        "messages",
+        "media_included",
+        "ocr_chars"
+      ],
+      "properties": {
+        "messages": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total message count in the payload."
+        },
+        "media_included": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total count of messages with an enriched media object included."
+        },
+        "ocr_chars": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total character count of OCR text included across messages (0 when ocr=none)."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false,
@@ -186,9 +212,21 @@
         "kind": {
           "type": "string",
           "enum": [
-            "image"
+            "image",
+            "video"
           ],
           "description": "Media kind identifier."
+        },
+        "duration_s": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Video duration in seconds."
+        },
+        "poster": {
+          "type": "string",
+          "description": "Video poster thumbnail URL path."
         },
         "quality": {
           "type": "string",
@@ -206,9 +244,11 @@
             "jpg",
             "png",
             "gif",
-            "webp"
+            "webp",
+            "mp4",
+            "mov"
           ],
-          "description": "Normalized image file format."
+          "description": "Normalized media file format."
         },
         "width": {
           "type": [
@@ -292,7 +332,6 @@
           "type": "object",
           "required": [
             "status",
-            "text",
             "provider",
             "confidence"
           ],

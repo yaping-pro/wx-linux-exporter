@@ -36,6 +36,7 @@ DEFAULT_TOKEN = (
     or os.environ.get("WX_EXPORT_TOKEN", "").strip()
     or os.environ.get("WXPAD_TOKEN", "").strip()
 )
+DEFAULT_PUBLIC_BASE_URL = os.environ.get("WECHAT_PUBLIC_BASE_URL", "").strip()
 DEFAULT_WEBHOOK_URL = os.environ.get("ASSISTANT_WEBHOOK_URL", "")
 DEFAULT_WEBHOOK_TYPE = os.environ.get(
     "ASSISTANT_WEBHOOK_TYPE", "custom"
@@ -56,17 +57,28 @@ def fetch_export(
     token: str = "",
     watermark: Optional[str] = None,
     timeout: int = 15,
+    media: str = "all",
+    media_chats: str = "",
+    ocr: str = "head",
 ) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
     url = endpoint
+    parsed = urllib.parse.urlparse(endpoint)
+    query = urllib.parse.parse_qs(parsed.query)
+
     if watermark:
-        parsed = urllib.parse.urlparse(endpoint)
-        query = urllib.parse.parse_qs(parsed.query)
         query["since"] = [watermark]
-        url = urllib.parse.urlunparse(
-            parsed._replace(
-                query=urllib.parse.urlencode(query, doseq=True)
-            )
+    if media:
+        query["media"] = [media]
+    if media_chats:
+        query["media_chats"] = [media_chats]
+    if ocr:
+        query["ocr"] = [ocr]
+
+    url = urllib.parse.urlunparse(
+        parsed._replace(
+            query=urllib.parse.urlencode(query, doseq=True)
         )
+    )
 
     req = urllib.request.Request(
         url,
@@ -105,6 +117,7 @@ def format_payload(
     msg: Dict[str, Any],
     include_media: bool = True,
     export_url: str = "",
+    public_base_url: str = "",
 ) -> Dict[str, Any]:
     sender = msg.get("sender", "")
     ts = msg.get("ts", "")
@@ -125,6 +138,8 @@ def format_payload(
     has_media = isinstance(media, dict) and bool(media)
 
     media_url: Optional[str] = None
+    media_url_abs: Optional[str] = None
+    media_url_auth: Optional[str] = None
     media_asset_id: Optional[str] = None
     chat_name: Optional[str] = None
     ocr_text: Optional[str] = None
@@ -145,14 +160,20 @@ def format_payload(
         )
         ocr_text = ocr.get("text")
 
+        if media_url:
+            base = (
+                public_base_url.rstrip("/")
+                or derive_base_url(export_url).rstrip("/")
+            )
+            media_url_abs = f"{base}{media_url}" if base else media_url
+            media_url_auth = "bearer"
+
     if webhook_type == "feishu":
         # Format as Feishu interactive / text webhook payload
         header = f"[{'Self' if is_sender else sender}] in {chat_id} ({ts})"
         text_content = f"{header}\n{content}"
-        if has_media and media_url:
-            base = derive_base_url(export_url)
-            full_url = f"{base}{media_url}" if base else media_url
-            text_content = f"{text_content}\n🖼 原图: {full_url}"
+        if has_media and media_url_abs:
+            text_content = f"{text_content}\n🖼 原图: {media_url_abs}"
         return {
             "msg_type": "text",
             "content": {
@@ -177,6 +198,10 @@ def format_payload(
         if has_media:
             if media_url is not None:
                 inputs["media_url"] = media_url
+            if media_url_abs is not None:
+                inputs["media_url_abs"] = media_url_abs
+            if media_url_auth is not None:
+                inputs["media_url_auth"] = media_url_auth
             if media_asset_id is not None:
                 inputs["media_asset_id"] = media_asset_id
             if chat_name is not None:
@@ -208,6 +233,10 @@ def format_payload(
     if has_media:
         if media_url is not None:
             payload["media_url"] = media_url
+        if media_url_abs is not None:
+            payload["media_url_abs"] = media_url_abs
+        if media_url_auth is not None:
+            payload["media_url_auth"] = media_url_auth
         if media_asset_id is not None:
             payload["media_asset_id"] = media_asset_id
         if chat_name is not None:
@@ -252,6 +281,7 @@ def process_chats(
     ignore_self: bool = False,
     include_media: bool = True,
     export_url: str = "",
+    public_base_url: str = "",
 ) -> int:
     sent_count = 0
     for chat in chats:
@@ -271,6 +301,7 @@ def process_chats(
                 msg,
                 include_media=include_media,
                 export_url=export_url,
+                public_base_url=public_base_url,
             )
             ok = post_webhook(webhook_url, payload, dry_run=dry_run)
             if ok:
@@ -296,6 +327,31 @@ def parse_args() -> argparse.Namespace:
         "--token",
         default=DEFAULT_TOKEN,
         help="Bearer token for daemon authentication",
+    )
+    parser.add_argument(
+        "--public-base-url",
+        default=DEFAULT_PUBLIC_BASE_URL,
+        help=(
+            "Public base URL for constructing absolute media URLs "
+            "(default: env WECHAT_PUBLIC_BASE_URL or scheme+netloc)"
+        ),
+    )
+    parser.add_argument(
+        "--media",
+        choices=["none", "image", "video", "all"],
+        default="all",
+        help="Media inclusion filter passed to export endpoint (default: all)",
+    )
+    parser.add_argument(
+        "--media-chats",
+        default="",
+        help="Comma-separated chat_ids to filter media enrichment at export",
+    )
+    parser.add_argument(
+        "--ocr",
+        choices=["none", "head", "full"],
+        default="head",
+        help="OCR projection detail level passed to export (default: head)",
     )
     parser.add_argument(
         "--webhook-url",
@@ -358,7 +414,12 @@ def main() -> int:
 
     while True:
         code, data, err = fetch_export(
-            args.endpoint, token=args.token, watermark=current_watermark
+            args.endpoint,
+            token=args.token,
+            watermark=current_watermark,
+            media=args.media,
+            media_chats=args.media_chats,
+            ocr=args.ocr,
         )
         if err or code != 200:
             print(f"[poll] Fetch error (code={code}): {err}", file=sys.stderr)
@@ -376,6 +437,7 @@ def main() -> int:
                     ignore_self=args.ignore_self,
                     include_media=args.include_media,
                     export_url=args.endpoint,
+                    public_base_url=args.public_base_url,
                 )
                 print(
                     f"[poll] Forwarded {count} messages to assistant webhook "
