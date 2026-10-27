@@ -24,6 +24,7 @@
 - [🧩 媒体富化能力矩阵（图片 / 视频 / 语音 / 文件）](#-媒体富化能力矩阵图片--视频--语音--文件)
 - [🛠️ 从源码安装与构建](#️-从源码安装与构建)
 - [⚙️ 服务编排与 Systemd 配置](#️-服务编排与-systemd-配置)
+- [🐳 容器化部署 (Docker & Compose)](docs/DOCKER.md)
 - [🤖 接入个人 AI 助理 (Muse 早报 / Webhook)](#-接入个人-ai-助理-muse-早报--webhook)
 - [📊 数据契约与导出 Schema](#-数据契约与导出-schema)
 - [❓ 常见问题与排错指南 (FAQ)](#-常见问题与排错指南-faq)
@@ -117,7 +118,7 @@ bash scripts/selfcheck.sh
 | 媒体类型 | 支持状态 | 实现机制 | 成本 / 边界说明 |
 | :--- | :--- | :--- | :--- |
 | **图片** | ✅ **完全支持** | 本地解密原图落盘 + 绝对路径 `media_url_abs` + 可选 RapidOCR 文本投影 | 纯本地处理，零网络开销；Muse 侧可直接接多模态大模型 |
-| **视频** | ✅ **落盘 + 元数据** | 扫描本地硬链接提取 MP4、时长与封面 (`poster`) | **不做本地转码/ASR**；**加密视频未在实机验证**（无法解密时标记 `note: "视频（不可解密）"`） |
+| **视频** | ✅ **落盘 + 元数据** | 扫描本地硬链接提取 MP4、时长与封面 (`poster`) | **不做本地转码/ASR**；**实机实测均为明文 MP4**（未见加密容器；异常/无法识别时标记 `note: "视频（不可解密）"`） |
 | **语音** | ✅ **完全支持** | 纯读本地 `packed_info_data` 提取微信客户端自带转文字 | **零成本**：本地提取微信转写结果，无网络/无模型消耗 |
 | **文件附件** | ✅ **可选支持** | MinerU **agent 免费通道** (≤10MB) / **precise 通道** (≤200MB) | 需用户显式配置并自愿开启云端解析 |
 ```bash
@@ -173,6 +174,23 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 ```
 
 </details>
+
+### 🐳 容器化部署 (Docker & Compose)
+
+针对 Homelab / 家庭服务器环境，项目提供了开箱即用的只读容器编排配置（支持 `api` 与 `worker` 两种 Profile）：
+
+```bash
+# 1. 设置安全 Token
+export WECHAT_TOKEN=$(openssl rand -hex 32)
+
+# 2. 启动只读 API 导出服务
+docker compose --profile api up -d
+
+# 3. 验证健康状态
+curl -s http://127.0.0.1:8765/health
+```
+
+完整只读挂载规范、非 Root 运行机制、PUID/PGID 自定义及 OCR 构建说明，详见完整文档：[**Docker 部署指南 (docs/DOCKER.md)**](docs/DOCKER.md)。
 
 ---
 

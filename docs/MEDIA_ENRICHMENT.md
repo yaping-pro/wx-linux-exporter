@@ -137,9 +137,21 @@ appmsg(<type>6</type>).<md5>  →  hardlink.db : file_hardlink_info_v4.md5
   "video": {
     "max_bytes": 524288000,
     "copy_mode": "copy",
-    "keep_thumb": true
+    "keep_thumb": true,
+    "thumbnail": {
+      "mode": "auto",
+      "ffmpeg_timeout": 20
+    }
   }
   ```
+- **缩略图策略与 ffmpeg 抽帧（可选依赖）**：
+  - `thumbnail.mode`：
+    - `auto`（默认）：优先使用微信原生缩略图；微信未提供封面时，若系统存在 `ffmpeg` 则自动抽帧。
+    - `wechat`：仅使用微信原生缩略图，不调用 ffmpeg。
+    - `ffmpeg`：强制使用 ffmpeg 抽帧（即使微信已提供封面）。
+    - `none`：不生成缩略图。
+  - 抽帧命令：`ffmpeg -nostdin -loglevel error -ss 1 -i <video> -frames:v 1 -vf scale='min(720,iw)':-2 -y <out.jpg>`。
+  - 容错保证：缺失 ffmpeg、抽帧超时或失败时，视频仍保持 `state: "ready"`，`thumb` 为 `null`，并在 ledger 记录 `thumb_error`（`"no_ffmpeg"` / `"timeout"` / `"failed"`），绝不阻碍视频正常导出。
 - **定位与落盘**：
   - 优先从 `hardlink.db` 检索 `video_hardlink_info_v4`，退回 `msg/video` 与 `msg/attach` 目录启发式探测。
   - 明文 MP4（偏移 4 起为 `ftyp`）直接按 `video.copy_mode`（copy 或 hardlink）落盘到 `exports/media/<date>/<md5>/video.mp4`；同 md5 缩略图（若存在）解密后保存为 `thumb.jpg`。
@@ -245,7 +257,7 @@ from collections import Counter;print(Counter(v['state'] for v in d['assets'].va
 | 限制 / 现状 | 说明 |
 | :--- | :--- |
 | 图片（type 3）解密实测与支持 | 18,402/18,402 全部 V2 三段式、kvcomm 离线推导（AES-128-ECB + 单字节 XOR，xor_key=0x0C）、格式分布 jpg 80.65% / wxgf 11.75% / png 7.60%、画质可及性 hd 16.07% / full 29.42% / 仅缩略图 54.51%、明文 Thumb 兜底覆盖率仅 1.5%–11% 不可行。现已支持离线解密、变体择优（_h > full > _t > _b）与本地 OCR 富化，结构化附加至 `media` 字段，同时以 `text_head`（≤2000 字符截断投影）注入既有 `text` 字段以无缝兼容存量下游 |
-| 视频（type 43）支持 | 支持明文 MP4 定位（优先 hardlink.db，退回目录探测）、落盘 `exports/media/<date>/<md5>/video.mp4` 与缩略图 `thumb.jpg`。加密 .dat 保持 `encrypted_video_unverified` 跳过态，不做转码、不做 ASR |
+| 视频（type 43）实测与支持 | 2026-10-27 实机核验（146/146 个视频样本）：微信落盘视频文件头部偏移 4 字节均为 `66747970`（`ftyp`，即明文 MP4 标准魔数），未观察到加密 `.dat` 容器。支持明文 MP4 定位（优先 `hardlink.db` 的 `video_hardlink_info_v4`，退回目录探测）、落盘 `exports/media/<date>/<md5>/video.mp4` 与缩略图 `thumb.jpg`。加密分支与 `encrypted_video_unverified` 状态保留作防御性兼容，不做转码、不做 ASR |
 | 历史语音不回溯 | 见 §5 |
 | 覆盖率受限于"微信是否已下载" | 文件是**点击才下载**；headless 客户端不会自动落盘所有附件，因此 `missing_source` 属正常现象 |
 | `hardlink.db` 表结构随微信版本变化 | 升级微信后需回归验证 `file_hardlink_info_v4` |

@@ -10,7 +10,11 @@
   "video": {
     "max_bytes": 524288000,
     "copy_mode": "copy",
-    "keep_thumb": true
+    "keep_thumb": true,
+    "thumbnail": {
+      "mode": "auto",
+      "ffmpeg_timeout": 20
+    }
   },
   "image": {
     "enabled": false,

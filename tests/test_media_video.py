@@ -14,7 +14,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import struct
 import sys
 import tempfile
@@ -464,6 +466,281 @@ class TestMediaVideo(unittest.TestCase):
         finally:
             wechat_image.resolve_keys = orig_resolve
             wechat_image.decrypt_dat = orig_decrypt
+
+    def test_video_thumb_no_ffmpeg(self):
+        """When no ffmpeg/thumb, state=ready & thumb_error=no_ffmpeg."""
+        chat_id = "test_user_video"
+        lid = 301
+        ct = int(time.time()) - 100
+        asset_md5 = "11111111111111111111111111111111"
+        mp4_data = _create_synthetic_mp4(720, 1280, 5)
+
+        month_dir = self.video_root / "2026-10"
+        month_dir.mkdir(parents=True, exist_ok=True)
+        (month_dir / f"{asset_md5}.mp4").write_bytes(mp4_data)
+
+        xml = (
+            f'<videomsg length="{len(mp4_data)}" playlength="5" '
+            f'md5="{asset_md5}"/>'
+        )
+        _setup_decrypted_db(self.decrypted, chat_id, lid, ct, xml,
+                            local_type=43)
+
+        policy = dict(wechat_media.DEFAULT_POLICY_BODY)
+        policy["enabled"] = True
+        policy["chat_allowlist"] = [chat_id]
+        policy["kinds"] = {
+            "file": False, "image": False, "voice": False, "video": True
+        }
+        policy["video"] = {
+            "max_bytes": 524288000,
+            "copy_mode": "copy",
+            "keep_thumb": True,
+            "thumbnail": {"mode": "auto", "ffmpeg_timeout": 20},
+        }
+        policy["wechat_account_dir"] = str(self.account_dir)
+        policy_path = self.vault / "policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+        orig_which = shutil.which
+        try:
+            shutil.which = lambda c: None if c == "ffmpeg" else orig_which(c)
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "wechat_media.py", "--policy", str(policy_path),
+                    "--vault", str(self.vault)
+                ]
+                wechat_media.main()
+            finally:
+                sys.argv = old_argv
+        finally:
+            shutil.which = orig_which
+
+        ledger_file = self.vault / "state" / "media_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        asset = ledger["assets"].get(asset_md5)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["state"], "ready")
+        self.assertIsNone(asset["thumb"])
+        self.assertEqual(asset["thumb_error"], "no_ffmpeg")
+
+    def test_video_thumb_ffmpeg_success(self):
+        """When ffmpeg succeeds, thumb exists on disk and in ledger."""
+        chat_id = "test_user_video"
+        lid = 302
+        ct = int(time.time()) - 100
+        asset_md5 = "22222222222222222222222222222222"
+        mp4_data = _create_synthetic_mp4(720, 1280, 5)
+
+        month_dir = self.video_root / "2026-10"
+        month_dir.mkdir(parents=True, exist_ok=True)
+        (month_dir / f"{asset_md5}.mp4").write_bytes(mp4_data)
+
+        xml = (
+            f'<videomsg length="{len(mp4_data)}" playlength="5" '
+            f'md5="{asset_md5}"/>'
+        )
+        _setup_decrypted_db(self.decrypted, chat_id, lid, ct, xml,
+                            local_type=43)
+
+        policy = dict(wechat_media.DEFAULT_POLICY_BODY)
+        policy["enabled"] = True
+        policy["chat_allowlist"] = [chat_id]
+        policy["kinds"] = {
+            "file": False, "image": False, "voice": False, "video": True
+        }
+        policy["video"] = {
+            "max_bytes": 524288000,
+            "copy_mode": "copy",
+            "keep_thumb": True,
+            "thumbnail": {"mode": "auto", "ffmpeg_timeout": 20},
+        }
+        policy["wechat_account_dir"] = str(self.account_dir)
+        policy_path = self.vault / "policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+        orig_which = shutil.which
+        orig_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "/mock/ffmpeg":
+                out_file = Path(cmd[-1])
+                out_file.write_bytes(
+                    b"\xff\xd8\xff\xe0fake_jpg_content\xff\xd9"
+                )
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=b"", stderr=b""
+                )
+            return orig_run(cmd, *args, **kwargs)
+
+        try:
+            shutil.which = (
+                lambda c: "/mock/ffmpeg" if c == "ffmpeg" else orig_which(c)
+            )
+            subprocess.run = fake_run
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "wechat_media.py", "--policy", str(policy_path),
+                    "--vault", str(self.vault)
+                ]
+                wechat_media.main()
+            finally:
+                sys.argv = old_argv
+        finally:
+            shutil.which = orig_which
+            subprocess.run = orig_run
+
+        ledger_file = self.vault / "state" / "media_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        asset = ledger["assets"].get(asset_md5)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["state"], "ready")
+        self.assertIsNotNone(asset["thumb"])
+        self.assertIsNone(asset["thumb_error"])
+        self.assertTrue((self.vault / "exports" / asset["thumb"]).is_file())
+
+    def test_video_thumb_ffmpeg_timeout(self):
+        """When ffmpeg times out, state is ready and thumb_error is timeout."""
+        chat_id = "test_user_video"
+        lid = 303
+        ct = int(time.time()) - 100
+        asset_md5 = "33333333333333333333333333333333"
+        mp4_data = _create_synthetic_mp4(720, 1280, 5)
+
+        month_dir = self.video_root / "2026-10"
+        month_dir.mkdir(parents=True, exist_ok=True)
+        (month_dir / f"{asset_md5}.mp4").write_bytes(mp4_data)
+
+        xml = (
+            f'<videomsg length="{len(mp4_data)}" playlength="5" '
+            f'md5="{asset_md5}"/>'
+        )
+        _setup_decrypted_db(self.decrypted, chat_id, lid, ct, xml,
+                            local_type=43)
+
+        policy = dict(wechat_media.DEFAULT_POLICY_BODY)
+        policy["enabled"] = True
+        policy["chat_allowlist"] = [chat_id]
+        policy["kinds"] = {
+            "file": False, "image": False, "voice": False, "video": True
+        }
+        policy["video"] = {
+            "max_bytes": 524288000,
+            "copy_mode": "copy",
+            "keep_thumb": True,
+            "thumbnail": {"mode": "auto", "ffmpeg_timeout": 5},
+        }
+        policy["wechat_account_dir"] = str(self.account_dir)
+        policy_path = self.vault / "policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+        orig_which = shutil.which
+        orig_run = subprocess.run
+
+        def fake_run_timeout(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "/mock/ffmpeg":
+                raise subprocess.TimeoutExpired(cmd, timeout=5)
+            return orig_run(cmd, *args, **kwargs)
+
+        try:
+            shutil.which = (
+                lambda c: "/mock/ffmpeg" if c == "ffmpeg" else orig_which(c)
+            )
+            subprocess.run = fake_run_timeout
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "wechat_media.py", "--policy", str(policy_path),
+                    "--vault", str(self.vault)
+                ]
+                wechat_media.main()
+            finally:
+                sys.argv = old_argv
+        finally:
+            shutil.which = orig_which
+            subprocess.run = orig_run
+
+        ledger_file = self.vault / "state" / "media_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        asset = ledger["assets"].get(asset_md5)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["state"], "ready")
+        self.assertIsNone(asset["thumb"])
+        self.assertEqual(asset["thumb_error"], "timeout")
+
+    def test_video_thumb_mode_wechat_no_ffmpeg_call(self):
+        """When mode=wechat, ffmpeg subprocess is never invoked."""
+        chat_id = "test_user_video"
+        lid = 304
+        ct = int(time.time()) - 100
+        asset_md5 = "44444444444444444444444444444444"
+        mp4_data = _create_synthetic_mp4(720, 1280, 5)
+
+        month_dir = self.video_root / "2026-10"
+        month_dir.mkdir(parents=True, exist_ok=True)
+        (month_dir / f"{asset_md5}.mp4").write_bytes(mp4_data)
+
+        xml = (
+            f'<videomsg length="{len(mp4_data)}" playlength="5" '
+            f'md5="{asset_md5}"/>'
+        )
+        _setup_decrypted_db(self.decrypted, chat_id, lid, ct, xml,
+                            local_type=43)
+
+        policy = dict(wechat_media.DEFAULT_POLICY_BODY)
+        policy["enabled"] = True
+        policy["chat_allowlist"] = [chat_id]
+        policy["kinds"] = {
+            "file": False, "image": False, "voice": False, "video": True
+        }
+        policy["video"] = {
+            "max_bytes": 524288000,
+            "copy_mode": "copy",
+            "keep_thumb": True,
+            "thumbnail": {"mode": "wechat", "ffmpeg_timeout": 20},
+        }
+        policy["wechat_account_dir"] = str(self.account_dir)
+        policy_path = self.vault / "policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+
+        orig_which = shutil.which
+        orig_run = subprocess.run
+        ffmpeg_called = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd[0] == "/mock/ffmpeg":
+                ffmpeg_called.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0)
+            return orig_run(cmd, *args, **kwargs)
+
+        try:
+            shutil.which = (
+                lambda c: "/mock/ffmpeg" if c == "ffmpeg" else orig_which(c)
+            )
+            subprocess.run = fake_run
+            old_argv = sys.argv
+            try:
+                sys.argv = [
+                    "wechat_media.py", "--policy", str(policy_path),
+                    "--vault", str(self.vault)
+                ]
+                wechat_media.main()
+            finally:
+                sys.argv = old_argv
+        finally:
+            shutil.which = orig_which
+            subprocess.run = orig_run
+
+        self.assertEqual(len(ffmpeg_called), 0)
+        ledger_file = self.vault / "state" / "media_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        asset = ledger["assets"].get(asset_md5)
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["state"], "ready")
+        self.assertIsNone(asset["thumb"])
+        self.assertIsNone(asset["thumb_error"])
 
 
 if __name__ == "__main__":

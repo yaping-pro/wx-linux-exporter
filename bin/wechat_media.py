@@ -163,6 +163,7 @@ DEFAULT_POLICY_BODY = {
         "max_bytes": 524_288_000,
         "copy_mode": "copy",
         "keep_thumb": True,
+        "thumbnail": {"mode": "auto", "ffmpeg_timeout": 20},
     },
     "image": {
         "enabled": False,
@@ -1550,7 +1551,10 @@ def main() -> int:
         video_max_bytes = int(video_cfg.get("max_bytes") or 524_288_000)
         video_copy_mode = str(video_cfg.get("copy_mode") or "copy")
         keep_thumb = bool(video_cfg.get("keep_thumb", True))
-
+        thumb_cfg = video_cfg.get("thumbnail") or {}
+        thumb_mode = str(thumb_cfg.get("mode") or "auto").lower()
+        ffmpeg_timeout = int(thumb_cfg.get("ffmpeg_timeout") or 20)
+        ffmpeg_bin = shutil.which("ffmpeg")
         video_root = (
             Path(policy["wechat_video_root"]).expanduser()
             if policy.get("wechat_video_root")
@@ -1720,15 +1724,26 @@ def main() -> int:
 
             is_plaintext_mp4 = (
                 (len(head) >= 8 and head[4:8] == b"ftyp")
-                or (wechat_image and wechat_image.detect_format(head) in ("mp4", "mov"))
+                or (
+                    wechat_image
+                    and wechat_image.detect_format(head) in ("mp4", "mov")
+                )
             )
-            is_dat_v1_v2 = head.startswith(b"\x07\x08V2") or head.startswith(b"\x07\x08V1")
+            is_dat_v1_v2 = (
+                head.startswith(b"\x07\x08V2")
+                or head.startswith(b"\x07\x08V1")
+            )
 
+            # 本机实测实证（2026-10-27，样本 146 个视频）：
+            # Linux 微信接收的视频文件均为明文 MP4
+            # （偏移 4 字节为 66747970 即 'ftyp'），无加密容器。
+            # 以下分支保留作为防御性兼容。
             if not is_plaintext_mp4 and is_dat_v1_v2:
-                # Encrypted video dat: unverified per spec
+                # 加密视频 .dat 容器：保留降级兼容路径（实测未命中）
                 rec = {
                     "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
-                    "deny_reason": "encrypted_video_unverified", "format": "mp4",
+                    "deny_reason": "encrypted_video_unverified",
+                    "format": "mp4",
                     "bytes": actual_size,
                     "duration_s": int(v_info.get("playlength") or 0) or None,
                     "width": None, "height": None,
@@ -1801,19 +1816,68 @@ def main() -> int:
 
             # Handle thumbnail
             thumb_rel_path: str | None = None
-            if keep_thumb and thumb_src and thumb_src.is_file() and wechat_image and image_keys:
-                dec_thumb = wechat_image.decrypt_dat(thumb_src, image_keys)
-                if dec_thumb and dec_thumb.data:
-                    thumb_export = date_dir / "thumb.jpg"
-                    thumb_export.write_bytes(dec_thumb.data)
-                    thumb_rel_path = f"media/{today}/{asset_id}/thumb.jpg"
-                    vault_thumb = vault_media_dir / "thumb.jpg"
-                    if not vault_thumb.exists():
-                        try:
-                            os.link(thumb_export, vault_thumb)
-                        except OSError:
-                            shutil.copy2(thumb_export, vault_thumb)
+            thumb_error: str | None = None
 
+            # 1. WeChat native thumbnail (preferred when mode is auto/wechat)
+            if keep_thumb and thumb_mode in ("auto", "wechat") and thumb_src:
+                if thumb_src.is_file() and wechat_image and image_keys:
+                    dec_thumb = wechat_image.decrypt_dat(thumb_src, image_keys)
+                    if dec_thumb and dec_thumb.data:
+                        thumb_export = date_dir / "thumb.jpg"
+                        thumb_export.write_bytes(dec_thumb.data)
+                        thumb_rel_path = f"media/{today}/{asset_id}/thumb.jpg"
+                        vault_thumb = vault_media_dir / "thumb.jpg"
+                        if not vault_thumb.exists():
+                            try:
+                                os.link(thumb_export, vault_thumb)
+                            except OSError:
+                                shutil.copy2(thumb_export, vault_thumb)
+
+            # 2. ffmpeg frame extraction fallback (if mode is auto or ffmpeg)
+            need_ffmpeg = (
+                keep_thumb
+                and (
+                    (thumb_mode == "auto" and thumb_rel_path is None)
+                    or thumb_mode == "ffmpeg"
+                )
+            )
+            if need_ffmpeg:
+                if not ffmpeg_bin:
+                    thumb_error = "no_ffmpeg"
+                else:
+                    thumb_export = date_dir / "thumb.jpg"
+                    cmd = [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-loglevel", "error",
+                        "-ss", "1",
+                        "-i", str(export_video),
+                        "-frames:v", "1",
+                        "-vf", "scale='min(720,iw)':-2",
+                        "-y", str(thumb_export),
+                    ]
+                    try:
+                        res = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            timeout=ffmpeg_timeout,
+                        )
+                        if res.returncode == 0 and thumb_export.is_file():
+                            thumb_rel_path = (
+                                f"media/{today}/{asset_id}/thumb.jpg"
+                            )
+                            vault_thumb = vault_media_dir / "thumb.jpg"
+                            if not vault_thumb.exists():
+                                try:
+                                    os.link(thumb_export, vault_thumb)
+                                except OSError:
+                                    shutil.copy2(thumb_export, vault_thumb)
+                        else:
+                            thumb_error = "failed"
+                    except subprocess.TimeoutExpired:
+                        thumb_error = "timeout"
+                    except Exception:
+                        thumb_error = "failed"
             rel_video_path = f"media/{today}/{asset_id}/video.mp4"
 
             rec = {
@@ -1828,6 +1892,7 @@ def main() -> int:
                 "height": final_height,
                 "path": rel_video_path,
                 "thumb": thumb_rel_path,
+                "thumb_error": thumb_error,
                 "anchor": anchor,
                 "source": "hardlink" if how == "hardlink" else "probe",
                 "create_time": ct,
