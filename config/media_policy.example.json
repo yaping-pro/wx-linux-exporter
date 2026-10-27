@@ -7,6 +7,29 @@
     "voice": true,
     "video": false
   },
+  "video": {
+    "max_bytes": 524288000,
+    "copy_mode": "copy",
+    "keep_thumb": true,
+    "thumbnail": {
+      "mode": "auto",
+      "ffmpeg_timeout": 20
+    }
+  },
+  "image": {
+    "enabled": false,
+    "quality_preference": ["hd", "full", "thumb", "bubble"],
+    "max_pixels": 50000000,
+    "allow_sudo_memscan": false,
+    "wxgf": {
+      "animated": "skip"
+    },
+    "ocr": {
+      "enabled": true,
+      "providers": ["rapidocr", "tesseract"],
+      "timeout": 60
+    }
+  },
   "file_ext_allow": ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "htm", "md", "txt", "csv"],
   "skip_ext": ["zip", "rar", "7z", "gz", "svg", "m4a", "mp3", "mp4"],
   "max_bytes": 10485760,

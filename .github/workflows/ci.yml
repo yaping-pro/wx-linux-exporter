@@ -11,14 +11,16 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     steps:
       - uses: actions/checkout@v7
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
-
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies (hash-pinned)
         run: |
           python -m pip install --upgrade pip
@@ -44,12 +46,31 @@ jobs:
         run: |
           python3 clients/test_assistant_webhook.py
 
-      - name: Regression tests (media enrichment + chat filtering)
+      - name: Regression tests
         run: |
-          for t in tests/test_*.py; do
-            echo "== ${t}"
-            python3 "${t}"
-          done
+          export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+          for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
+
+  docker-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate Docker Compose Config
+        env:
+          WECHAT_TOKEN: "ci_test_token_0123456789abcdef"
+        run: |
+          docker compose config
+
+      - name: Build Docker image (standard)
+        run: |
+          docker build -t wx-linux-exporter:test .
+
+      - name: Verify CLI Entrypoints inside Container
+        run: |
+          docker run --rm wx-linux-exporter:test wxexport --help | head -5
+          docker run --rm wx-linux-exporter:test wxprobe --help | head -3
+          docker run --rm wx-linux-exporter:test wxmedia --help | head -3
 
   release:
     needs: lint-and-test

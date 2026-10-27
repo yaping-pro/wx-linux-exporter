@@ -6,9 +6,54 @@
 ---
 
 ## [Unreleased]
-### Added
-- （待填）
 
+---
+
+## [1.4.0] - 2026-10-27
+> 包版本 1.4.0 / 数据契约版本 1.3.1（契约本身未升版，本次为能力性发布）
+
+### Added
+- **分页 + 流式输出 + OpenAPI 3.1 契约规范（契约 v1.3.1，纯增量）**：
+  - **游标分页（`/api/wechat/export`）**：
+    - `limit`（非负整数，默认 `0` = 不限）：单次最多返回消息数，消息跨全部允许会话严格按 `(create_time, chat_id, local_id)` 升序推进；
+    - `cursor`（base64url 编码）：从指定位置之后继续；格式不符或非法时返回 `400 {"error":{"code":"invalid_cursor",...}}`；
+    - 响应根新增 `next_cursor`（有后续给出，否则 `null`；`limit=0` 恒为 `null`）；`payload_stats` 补充 `truncated: true|false`；
+    - `watermark` 水位语义保证：有 `next_cursor`（截断）时不提前推进水位（保持 `since`），仅在全部已结算（`next_cursor` 为 `null`）时推进。
+  - **流式分块输出（`format=ndjson`）**：
+    - 支持 `format=ndjson`（默认 `json`），输出 `Content-Type: application/x-ndjson`；
+    - 采用分块传输编码（`Transfer-Encoding: chunked`），边生成边写，行序列严格为 `manifest` 首行、`chat` 行、`message` 行、`end` 末行；逐字段与 JSON 模式保持一致；
+    - 与 `limit`、`cursor`、`media`、`ocr` 完全兼容。
+  - **OpenAPI 3.1 规范**：
+    - 新建 `docs/openapi.yaml`，实写覆盖 `/api/wechat/export`、`/api/wechat/media`、`/api/wechat/media/{asset_id}/{filename}` 与 `/api/health/briefing`；包括 BearerAuth 鉴权、HTTP 206 Range 分片、`media`/`ocr` 枚举与 `next_cursor`/`payload_stats` 字段。
+  - **测试与文档**：
+    - 新增 `tests/test_api_paging.py`，完整覆盖 limit 截断拼接、cursor 解析/400、非法 limit 400、ndjson 行序与协议头、分页水位不提前推进；
+    - 更新 `docs/DATA_CONTRACT.md` 升至 v1.3.1，声明纯增量兼容。
+- **三个正交过滤开关 + 视频注入 + 体积统计（契约 v1.3.0）**：
+  - **三个正交查询开关（`/api/wechat/export`）**：
+    - `media ∈ none|image|video|all`（默认 `all`）：按需控制媒体对象注入，未选中媒体消息保留 `note`（「图片」「视频」），消费端可按需事后拉取；
+    - `media_chats`（逗号分隔 chat_id，默认全选）：仅指定会话注入 `media`，其余会话优雅降级为 `note`；
+    - `ocr ∈ none|head|full`（默认 `head`）：`none` 彻底移除 OCR 与投影，`head` 仅 `text` 投影，`full` 保留 `text` 投影与 `media.ocr.text` 全文。
+    - 针对新增参数引入结构化错误响应 `400 {"error":{"code":"invalid_param","message":"...","hint":"..."}}`，保持既有错误响应形态不变。
+  - **视频富化注入与媒体服务扩展**：
+    - 就绪视频消息注入结构化 `media` 对象（含 `asset_id`、`duration_s`、`poster`、`format`、`bytes`、`width`、`height`、`anchor`、`source`）；
+    - `media_note(asset, kind)` 泛化：统一处理图片与视频未就绪/跳过状态映射（`视频（处理中）`、`视频（未下载）`、`视频（超大）`、`视频（解析失败）`）；
+    - `ALLOWED_IMAGE_EXTS` 重命名为 `ALLOWED_MEDIA_EXTS`，扩展支持 `mp4` 与 `mov`；媒体端点支持视频 `video/mp4` MIME 与 HTTP `Range`（206 Partial Content / `Content-Range`）断点续传播放；
+    - `GET /api/wechat/media` 增加 `kind` 筛选（支持 `image`、`video` 或 `image,video`，默认两者），返回结果携带 `duration_s` 与 `poster`。
+  - **Payload 体积统计**：导出响应根新增 `payload_stats: {"messages": N, "media_included": N, "ocr_chars": N}`，`ocr=none` 时 `ocr_chars` 强制为 0。
+  - `schema/export.schema.json`：同步更新 `mediaItem`（新增 `video` kind、`mp4`/`mov` format、`duration_s`、`poster`）与根对象 `payload_stats`。
+  - `docs/DATA_CONTRACT.md`：升级至 v1.3.0 规范，详细描述三个开关语义、视频媒体形状、payload_stats 统计与严格向后兼容性声明。
+  - `tests/test_media_filters.py`：新增测试套件，全面覆盖非法参数 400 结构、正交过滤开关、视频 media 形状、media_note 映射、Range 206 分片响应与 `payload_stats` 计数准确性。
+- **图片离线解密与 OCR 富化接入（契约 v1.2.0）**：
+  - `bin/wechat_media.py`：新增图片消息（`local_type=3`）解析流。通过 `hardlink.db`（`image_hardlink_info_v4`）与磁盘模式探测定位 `.dat` 变体，支持变体画质择优（`_h > full > _t > _b`）、wxgf 动图策略过滤、惰性解密器与本地 OCR 协同、防解压炸弹像素闸、双目录物化（`exports/media/<date>/<asset_id>/` 与 `vault/media/<asset_id>/`）以及基于内容哈希的跨会话幂等复用。
+  - `bin/wechat_export_api.py`：
+    - `GET /api/wechat/media`：图片检索端点，支持 OCR 文本模糊子串、会话 ID、时间范围与画质筛选；支持 `include=context` 获取紧邻前后各最多 2 条上下文（文本 200 字符截断，限额自动收紧至 50），严格套用 Bearer 鉴权与 `blocklist` 屏蔽会话隔离。
+    - `GET /api/wechat/media/<asset_id>/<filename>`：原图二进制下载端点，支持 `Content-Type` 自适应、ETag (sha256) 与 `If-None-Match` 304 缓存协商；路径严格限制在 `vault/media/` 目录下（403 阻断路径穿越），扩展名白名单校验，屏蔽会话资源防探测。
+    - `/api/wechat/export`：就绪图片消息附加可选 `media` 对象，`text` 字段填入 `media.ocr.text` 的截断投影（≤2000 字符，未就绪保持空串），无缝兼容仅读取 `text` 的既有消费端；`anchor` 附带 `chat_name` 与原始会话坐标。
+  - `schema/export.schema.json`：新增严格定义的 `mediaItem` 与 `anchor` Schema（`additionalProperties: false`），保持向后兼容。
+  - `docs/DATA_CONTRACT.md`：新增 v1.2.0 契约章节、检索与原图端点规范、上下文抽取说明与消费端读取指引。
+  - `docs/MEDIA_ENRICHMENT.md`：更正第 9 节结论为实机验证事实（18,402 个文件 100% 离线 V2 可解），更新架构与能力边界。
+  - `config/media_policy.example.json`：新增 `image` 段配置模板（默认关闭）。
+  - `tests/test_media_images.py`：综合测试套件，全面覆盖画质择优、asset_id 跨群去重复用、anchor 精准定位、OCR 三态降级、wxgf 动图跳过、blocklist 全端点拦截、路径穿越防御、304 协商缓存、Schema 严格性、上下文无串味抽取与截断、`chat_name` 智能解析与回退。
 ---
 
 ## [v1.1.1] - 2026-10-16

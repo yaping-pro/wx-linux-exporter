@@ -29,16 +29,26 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
-import zstandard
+try:
+    import zstandard
+except ImportError:
+    zstandard = None
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SCRIPT_DIR = Path(__file__).resolve().parent
-MINERU_CLIENT = SCRIPT_DIR / "mineru_agent.py"
+try:
+    import mineru_agent
+    _mf = getattr(mineru_agent, "__file__", None)
+    MINERU_CLIENT = Path(_mf).resolve() if _mf else SCRIPT_DIR / "mineru_agent.py"
+except ImportError:
+    MINERU_CLIENT = SCRIPT_DIR / "mineru_agent.py"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import wx_store  # noqa: E402
 
 DEFAULT_VAULT = Path.home() / ".local/share" / "wechat-vault"
 DEFAULT_POLICY = DEFAULT_VAULT / "config" / "media_policy.json"
@@ -129,7 +139,7 @@ def extract_voice_text(packed) -> str:
     b = bytes(packed) if isinstance(packed, (bytes, bytearray, memoryview)) else b""
     if not b:
         return ""
-    if b[:4] == ZSTD_MAGIC:
+    if b[:4] == ZSTD_MAGIC and zstandard is not None:
         try:
             b = zstandard.ZstdDecompressor().decompress(b)
         except Exception:  # noqa: BLE001
@@ -149,6 +159,20 @@ DEFAULT_POLICY_BODY = {
     "enabled": False,
     "chat_allowlist": [],
     "kinds": {"file": True, "image": False, "voice": True, "video": False},
+    "video": {
+        "max_bytes": 524_288_000,
+        "copy_mode": "copy",
+        "keep_thumb": True,
+        "thumbnail": {"mode": "auto", "ffmpeg_timeout": 20},
+    },
+    "image": {
+        "enabled": False,
+        "quality_preference": ["hd", "full", "thumb", "bubble"],
+        "max_pixels": 50_000_000,
+        "allow_sudo_memscan": False,
+        "wxgf": {"animated": "skip"},
+        "ocr": {"enabled": True, "providers": ["rapidocr", "tesseract"], "timeout": 60},
+    },
     "file_ext_allow": ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt",
                        "html", "htm", "md", "txt", "csv"],
     "skip_ext": ["zip", "rar", "7z", "gz", "svg", "m4a", "mp3", "mp4"],
@@ -184,29 +208,11 @@ def load_policy(path: Path) -> dict:
 
 
 def load_ledger(path: Path) -> dict:
-    if path.is_file():
-        try:
-            d = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(d, dict):
-                d.setdefault("assets", {})
-                d.setdefault("by_message", {})
-                d.setdefault("daily", {})
-                return d
-        except Exception as e:  # noqa: BLE001
-            log(f"[WARN] ledger 解析失败，另起新账本：{e}")
-    return {"version": 1, "watermark": 0, "assets": {}, "by_message": {}, "daily": {}}
+    return wx_store.load_ledger(path)
 
 
 def save_json_atomic(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-
+    wx_store.save_ledger_atomic(path, obj)
 
 def resolve_decrypted(vault: Path) -> Path:
     cur = vault / "decrypted" / "current"
@@ -225,7 +231,7 @@ def decompress(raw) -> str:
         return ""
     b = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode("utf-8", "replace")
     b = bytes(b)
-    if b.startswith(ZSTD_MAGIC):
+    if b.startswith(ZSTD_MAGIC) and zstandard is not None:
         try:
             return zstandard.ZstdDecompressor().decompress(b).decode("utf-8", "replace")
         except Exception:  # noqa: BLE001
@@ -250,10 +256,14 @@ def load_hardlink(decrypted: Path) -> tuple[dict[int, str], dict[str, tuple]]:
     try:
         dir2id = {r[0]: r[1] for r in con.execute("SELECT rowid, username FROM dir2id")}
         files = {}
-        for md5, fn, d1, d2, size in con.execute(
-            "SELECT md5, file_name, dir1, dir2, file_size FROM file_hardlink_info_v4"
-        ):
-            files[str(md5)] = (str(fn), d1, d2, int(size or 0))
+        cursor = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_hardlink_info_v4'"
+        )
+        if cursor.fetchone():
+            for md5, fn, d1, d2, size in con.execute(
+                "SELECT md5, file_name, dir1, dir2, file_size FROM file_hardlink_info_v4"
+            ):
+                files[str(md5)] = (str(fn), d1, d2, int(size or 0))
         return dir2id, files
     finally:
         con.close()
@@ -447,6 +457,444 @@ def iter_voice_messages(decrypted: Path, allow_md5: set[str], since: int):
             con.close()
 
 
+def clean_asset_id(raw_name: str) -> str:
+    """去除 _t / _h / _b 后缀及扩展名，获取规范的 32 位十六进制 asset_id。"""
+    stem = Path(raw_name).stem.lower()
+    base = re.sub(r"_[thb]$", "", stem)
+    return base
+
+
+def variant_of_path(path: Path) -> str:
+    stem = path.stem.lower()
+    if stem.endswith("_h"):
+        return "_h"
+    elif stem.endswith("_t"):
+        return "_t"
+    elif stem.endswith("_b"):
+        return "_b"
+    return ""
+
+
+def quality_of_path(path: Path) -> str:
+    try:
+        import wechat_image
+        return wechat_image.quality_of(path)
+    except (ImportError, AttributeError):
+        stem = path.stem.lower()
+        if stem.endswith("_h"):
+            return "hd"
+        elif stem.endswith("_t"):
+            return "thumb"
+        elif stem.endswith("_b"):
+            return "bubble"
+        return "full"
+
+
+def rank_image_variants(paths: list[Path]) -> list[Path]:
+    try:
+        import wechat_image
+        return wechat_image.rank_variants(paths)
+    except (ImportError, AttributeError):
+        def _score(p: Path) -> int:
+            s = p.stem.lower()
+            if s.endswith("_h"):
+                return 4
+            elif s.endswith("_t"):
+                return 2
+            elif s.endswith("_b"):
+                return 1
+            return 3  # full (no suffix)
+
+        return sorted(paths, key=_score, reverse=True)
+
+
+def resolve_chat_name(chat_id: str, target: Path) -> str:
+    decrypted = resolve_decrypted(target) if (target / "decrypted").is_dir() else target
+    contact_path = decrypted / "contact" / "contact.db"
+    if contact_path.is_file():
+        try:
+            uri = f"file:{contact_path.resolve()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                cursor = con.execute("PRAGMA table_info(contact)")
+                cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
+                u_col = cols.get("username", "username")
+                r_col = cols.get("remark", "remark")
+                n_col = cols.get("nick_name", cols.get("nickname", "nick_name"))
+                a_col = cols.get("alias", "alias")
+                query = f"SELECT {r_col}, {n_col}, {a_col} FROM contact WHERE {u_col} = ?"
+                row = con.execute(query, (chat_id,)).fetchone()
+                if row:
+                    remark = str(row[0] or "").strip()
+                    nick = str(row[1] or "").strip()
+                    alias = str(row[2] or "").strip()
+                    display = remark or nick or alias
+                    if display:
+                        return display
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    session_path = decrypted / "session" / "session.db"
+    if session_path.is_file():
+        try:
+            uri = f"file:{session_path.resolve()}?mode=ro&immutable=1"
+            con = sqlite3.connect(uri, uri=True)
+            try:
+                cursor = con.execute("PRAGMA table_info(SessionTable)")
+                cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
+                if "username" in cols:
+                    u_col = cols["username"]
+                    d_col = (
+                        cols.get("display_name")
+                        or cols.get("remark")
+                        or cols.get("nick_name")
+                    )
+                    if d_col:
+                        query = f"SELECT {d_col} FROM SessionTable WHERE {u_col} = ?"
+                        row = con.execute(query, (chat_id,)).fetchone()
+                        if row and str(row[0] or "").strip():
+                            return str(row[0]).strip()
+            finally:
+                con.close()
+        except Exception:
+            pass
+
+    return chat_id
+
+
+def load_image_hardlink(decrypted: Path) -> tuple[dict[int, str], dict[str, tuple]]:
+    hl = decrypted / "hardlink" / "hardlink.db"
+    if not hl.is_file():
+        return {}, {}
+    con = sqlite3.connect(f"file:{hl}?mode=ro&immutable=1", uri=True)
+    try:
+        dir2id: dict[int, str] = {}
+        try:
+            dir2id = {r[0]: r[1] for r in con.execute("SELECT rowid, username FROM dir2id")}
+        except sqlite3.Error:
+            pass
+        images: dict[str, tuple] = {}
+        try:
+            cursor = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='image_hardlink_info_v4'"
+            )
+            if cursor.fetchone():
+                for md5, fn, d1, d2 in con.execute(
+                    "SELECT md5, file_name, dir1, dir2 FROM image_hardlink_info_v4"
+                ):
+                    images[str(md5).lower()] = (str(fn), d1, d2)
+        except sqlite3.Error:
+            pass
+        return dir2id, images
+    finally:
+        con.close()
+
+def load_video_hardlink(decrypted: Path) -> tuple[dict[int, str], dict[str, tuple]]:
+    hl = decrypted / "hardlink" / "hardlink.db"
+    if not hl.is_file():
+        return {}, {}
+    con = sqlite3.connect(f"file:{hl}?mode=ro&immutable=1", uri=True)
+    try:
+        dir2id: dict[int, str] = {}
+        try:
+            dir2id = {r[0]: r[1] for r in con.execute("SELECT rowid, username FROM dir2id")}
+        except sqlite3.Error:
+            pass
+        videos: dict[str, tuple] = {}
+        try:
+            cursor = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='video_hardlink_info_v4'"
+            )
+            if cursor.fetchone():
+                for md5, fn, d1, d2 in con.execute(
+                    "SELECT md5, file_name, dir1, dir2 FROM video_hardlink_info_v4"
+                ):
+                    videos[str(md5).lower()] = (str(fn), d1, d2)
+        except sqlite3.Error:
+            pass
+        return dir2id, videos
+    finally:
+        con.close()
+
+
+def find_video_source(
+    video_root: Path | None,
+    attach_root: Path | None,
+    chat_md5: str,
+    month: str | None,
+    asset_id: str,
+) -> tuple[Path | None, Path | None, str]:
+    """Locate video file and optional thumbnail for asset_id.
+
+    Returns (video_path, thumb_path, how).
+    """
+    thumb_path: Path | None = None
+    if attach_root:
+        # Look for thumbnail in attach_root
+        candidates = []
+        if month and re.fullmatch(r"\d{4}-\d{2}", month):
+            t = attach_root / chat_md5 / month / "Img" / f"{asset_id}_t.dat"
+            if t.is_file():
+                candidates.append(t)
+            p = attach_root / chat_md5 / month / "Img" / f"{asset_id}.dat"
+            if p.is_file():
+                candidates.append(p)
+        if not candidates and (attach_root / chat_md5).is_dir():
+            for m_dir in (attach_root / chat_md5).iterdir():
+                if m_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", m_dir.name):
+                    t = m_dir / "Img" / f"{asset_id}_t.dat"
+                    if t.is_file():
+                        candidates.append(t)
+                    p = m_dir / "Img" / f"{asset_id}.dat"
+                    if p.is_file():
+                        candidates.append(p)
+        if candidates:
+            thumb_path = candidates[0]
+
+    if not video_root or not video_root.is_dir():
+        return None, thumb_path, "missing_video_root"
+
+    # 1. Direct month lookup if month known
+    if month and re.fullmatch(r"\d{4}-\d{2}", month):
+        m_dir = video_root / month
+        if m_dir.is_dir():
+            for p in m_dir.glob(f"{asset_id}.*"):
+                if p.is_file():
+                    return p, thumb_path, "hardlink:month"
+            for p in (m_dir / chat_md5).glob(f"{asset_id}.*") if (m_dir / chat_md5).is_dir() else ():
+                if p.is_file():
+                    return p, thumb_path, "hardlink:month"
+
+    # 2. Search by month directories in video_root
+    found: list[Path] = []
+    for m_dir in video_root.iterdir():
+        if not m_dir.is_dir():
+            continue
+        for p in m_dir.glob(f"{asset_id}.*"):
+            if p.is_file():
+                found.append(p)
+        c_dir = m_dir / chat_md5
+        if c_dir.is_dir():
+            for p in c_dir.glob(f"{asset_id}.*"):
+                if p.is_file():
+                    found.append(p)
+
+    # Also check direct video_root / {asset_id}.*
+    for p in video_root.glob(f"{asset_id}.*"):
+        if p.is_file() and p not in found:
+            found.append(p)
+
+    if len(found) == 1:
+        return found[0], thumb_path, "probe:unique"
+    if len(found) > 1:
+        return None, thumb_path, f"unresolved:ambiguous_{len(found)}"
+
+    return None, thumb_path, "unresolved:not_found"
+
+def find_image_dat(
+    attach_root: Path | None,
+    cache_root: Path | None,
+    chat_md5: str,
+    month: str | None,
+    asset_id: str,
+) -> tuple[list[Path], str]:
+    """寻找与 asset_id 匹配的所有变体 .dat 文件。"""
+    candidates: list[Path] = []
+    if month and re.fullmatch(r"\d{4}-\d{2}", month):
+        if attach_root:
+            img_dir = attach_root / chat_md5 / month / "Img"
+            if img_dir.is_dir():
+                for suffix in ("_h.dat", ".dat", "_t.dat"):
+                    p = img_dir / f"{asset_id}{suffix}"
+                    if p.is_file():
+                        candidates.append(p)
+        if cache_root:
+            bubble_file = cache_root / month / "Message" / chat_md5 / "Bubble" / f"{asset_id}_b.dat"
+            if bubble_file.is_file():
+                candidates.append(bubble_file)
+        if candidates:
+            return candidates, "hardlink:month"
+
+    found_by_month: dict[str, list[Path]] = {}
+    if attach_root and (attach_root / chat_md5).is_dir():
+        for month_dir in (attach_root / chat_md5).iterdir():
+            if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                img_dir = month_dir / "Img"
+                if img_dir.is_dir():
+                    for suffix in ("_h.dat", ".dat", "_t.dat"):
+                        p = img_dir / f"{asset_id}{suffix}"
+                        if p.is_file():
+                            found_by_month.setdefault(month_dir.name, []).append(p)
+
+    if cache_root and cache_root.is_dir():
+        for month_dir in cache_root.iterdir():
+            if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                bubble_file = month_dir / "Message" / chat_md5 / "Bubble" / f"{asset_id}_b.dat"
+                if bubble_file.is_file():
+                    found_by_month.setdefault(month_dir.name, []).append(bubble_file)
+
+    if not found_by_month:
+        # 兜底：转发图片可能保存在最初接收该文件的其他会话目录下
+        if attach_root and attach_root.is_dir():
+            for c_dir in attach_root.iterdir():
+                if c_dir.is_dir() and c_dir.name != chat_md5:
+                    for month_dir in c_dir.iterdir():
+                        if month_dir.is_dir() and re.fullmatch(r"\d{4}-\d{2}", month_dir.name):
+                            img_dir = month_dir / "Img"
+                            if img_dir.is_dir():
+                                for suffix in ("_h.dat", ".dat", "_t.dat"):
+                                    p = img_dir / f"{asset_id}{suffix}"
+                                    if p.is_file():
+                                        found_by_month.setdefault(month_dir.name, []).append(p)
+
+    if not found_by_month:
+        return [], "unresolved:not_found"
+    if len(found_by_month) > 1:
+        return [], "unresolved:ambiguous_month"
+    single_month = next(iter(found_by_month.keys()))
+    return found_by_month[single_month], f"probe:{single_month}"
+
+
+def iter_image_messages(decrypted: Path, allow_md5: set[str], since: int):
+    """产出 (chat_id, local_id, create_time, sender, img_info)——仅图片消息。"""
+    shards = sorted(p for p in (decrypted / "message").glob("*.db")
+                    if re.fullmatch(r"(message|biz_message)_\d+\.db", p.name))
+    for shard in shards:
+        con = sqlite3.connect(f"file:{shard}?mode=ro&immutable=1", uri=True)
+        try:
+            chat_by_table: dict[str, str] = {}
+            n2id: dict[int, str] = {}
+            try:
+                for rid, uname in con.execute("SELECT rowid, user_name FROM Name2Id"):
+                    if not uname:
+                        continue
+                    uname_str = str(uname)
+                    n2id[int(rid)] = uname_str
+                    h = hashlib.md5(uname_str.encode()).hexdigest()
+                    if h in allow_md5:
+                        chat_by_table[h] = uname_str
+            except sqlite3.Error:
+                pass
+
+            for tbl, in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ):
+                chat = chat_by_table.get(tbl[4:])
+                if not chat:
+                    continue
+                is_group = chat.endswith("@chatroom")
+                q = (f"SELECT local_id, real_sender_id, create_time, message_content, compress_content "
+                     f"FROM [{tbl}] WHERE (local_type & 0xFFFFFFFF) = 3 AND create_time >= ? "
+                     f"ORDER BY create_time DESC")
+                for lid, rsid, ct, mc, cc in con.execute(q, (since,)):
+                    text = decompress(mc) or decompress(cc)
+                    sender = "我"
+                    if is_group:
+                        match_sender = re.match(r"^([a-zA-Z0-9_\-]+):\n", text)
+                        if match_sender:
+                            sender = match_sender.group(1)
+                        elif rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                    else:
+                        if rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                        elif rsid == 0:
+                            sender = "我"
+                        else:
+                            sender = chat
+
+                    m_md5 = (
+                        re.search(r'md5=["\']([0-9a-fA-F]{32}(?:_[thb])?)["\']', text)
+                        or re.search(r'<md5>([0-9a-fA-F]{32}(?:_[thb])?)</md5>', text)
+                    )
+                    m_len = (
+                        re.search(r'length=["\'](\d+)["\']', text)
+                        or re.search(r'<totallen>(\d+)</totallen>', text)
+                    )
+                    m_aes = re.search(r'aeskey=["\']([^"\']+)["\']', text)
+                    img_info = {
+                        "md5": (m_md5.group(1).lower() if m_md5 else ""),
+                        "length": int(m_len.group(1)) if m_len else 0,
+                        "aeskey": (m_aes.group(1) if m_aes else ""),
+                        "raw_xml": text,
+                    }
+                    yield chat, int(lid), int(ct), sender, img_info
+        finally:
+            con.close()
+
+def iter_video_messages(decrypted: Path, allow_md5: set[str], since: int):
+    """产出 (chat_id, local_id, create_time, sender, video_info)——仅视频消息 (local_type=43)。"""
+    shards = sorted(p for p in (decrypted / "message").glob("*.db")
+                    if re.fullmatch(r"(message|biz_message)_\d+\.db", p.name))
+    for shard in shards:
+        con = sqlite3.connect(f"file:{shard}?mode=ro&immutable=1", uri=True)
+        try:
+            chat_by_table: dict[str, str] = {}
+            n2id: dict[int, str] = {}
+            try:
+                for rid, uname in con.execute("SELECT rowid, user_name FROM Name2Id"):
+                    if not uname:
+                        continue
+                    uname_str = str(uname)
+                    n2id[int(rid)] = uname_str
+                    h = hashlib.md5(uname_str.encode()).hexdigest()
+                    if h in allow_md5:
+                        chat_by_table[h] = uname_str
+            except sqlite3.Error:
+                pass
+
+            for tbl, in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ):
+                chat = chat_by_table.get(tbl[4:])
+                if not chat:
+                    continue
+                is_group = chat.endswith("@chatroom")
+                q = (f"SELECT local_id, real_sender_id, create_time, message_content, compress_content "
+                     f"FROM [{tbl}] WHERE (local_type & 0xFFFFFFFF) = 43 AND create_time >= ? "
+                     f"ORDER BY create_time DESC")
+                for lid, rsid, ct, mc, cc in con.execute(q, (since,)):
+                    text = decompress(mc) or decompress(cc)
+                    sender = "我"
+                    if is_group:
+                        match_sender = re.match(r"^([a-zA-Z0-9_\-]+):\n", text)
+                        if match_sender:
+                            sender = match_sender.group(1)
+                        elif rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                    else:
+                        if rsid and int(rsid) in n2id:
+                            sender = n2id[int(rsid)]
+                        elif rsid == 0:
+                            sender = "我"
+                        else:
+                            sender = chat
+
+                    m_md5 = (
+                        re.search(r'md5=["\']([0-9a-fA-F]{32})["\']', text)
+                        or re.search(r'<md5>([0-9a-fA-F]{32})</md5>', text)
+                    )
+                    m_len = (
+                        re.search(r'length=["\'](\d+)["\']', text)
+                        or re.search(r'<totallen>(\d+)</totallen>', text)
+                    )
+                    m_playlen = (
+                        re.search(r'playlength=["\'](\d+)["\']', text)
+                        or re.search(r'<playlength>(\d+)</playlength>', text)
+                    )
+                    video_info = {
+                        "md5": (m_md5.group(1).lower() if m_md5 else ""),
+                        "length": int(m_len.group(1)) if m_len else 0,
+                        "playlength": int(m_playlen.group(1)) if m_playlen else 0,
+                        "raw_xml": text,
+                    }
+                    yield chat, int(lid), int(ct), sender, video_info
+        finally:
+            con.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="WeChat 媒体解析 worker")
     ap.add_argument("--policy", default=str(DEFAULT_POLICY))
@@ -473,8 +921,8 @@ def main() -> int:
         log("[INFO] chat_allowlist 为空 = 媒体全关，无事可做。")
         return 0
     kinds = policy.get("kinds") or {}
-    if not (kinds.get("file") or kinds.get("voice")):
-        log("[INFO] kinds.file 与 kinds.voice 均关闭，无事可做。")
+    if not (kinds.get("file") or kinds.get("voice") or kinds.get("image") or kinds.get("video")):
+        log("[INFO] kinds.file、kinds.voice、kinds.image 与 kinds.video 均关闭，无事可做。")
         return 0
 
     lock_path = vault / "state" / "media.lock"
@@ -485,10 +933,10 @@ def main() -> int:
     except BlockingIOError:
         log("[INFO] 已有 worker 在运行，跳过本轮。")
         return 0
-
     decrypted = resolve_decrypted(vault)
     if not (decrypted / "message").is_dir():
         log(f"[ERROR] 解密库不可用：{decrypted}")
+        lock_fh.close()
         return 1
 
     ledger_path = vault / "state" / "media_ledger.json"
@@ -508,11 +956,27 @@ def main() -> int:
     max_chars = int(render_cfg.get("max_chars_per_doc") or 4000)
 
     files_root = discover_wechat_files_root(policy.get("wechat_files_glob") or DEFAULT_WECHAT_GLOB)
-    if not files_root:
+    if not files_root and kinds.get("file"):
         log("[ERROR] 未找到微信接收文件目录（msg/file）。")
         return 1
-    log(f"[INFO] files_root={files_root}  vault={vault}  allow={allow}")
 
+    account_dir = (
+        Path(policy["wechat_account_dir"]).expanduser()
+        if policy.get("wechat_account_dir")
+        else (files_root.parent.parent if files_root else None)
+    )
+    attach_root = (
+        Path(policy["wechat_attach_root"]).expanduser()
+        if policy.get("wechat_attach_root")
+        else ((account_dir / "msg" / "attach") if account_dir else None)
+    )
+    cache_root = (
+        Path(policy["wechat_cache_root"]).expanduser()
+        if policy.get("wechat_cache_root")
+        else ((account_dir / "cache") if account_dir else None)
+    )
+    wxid = policy.get("wxid") or (account_dir.name if account_dir else "")
+    log(f"[INFO] files_root={files_root}  attach_root={attach_root}  vault={vault}  allow={allow}")
     dir2id, hl_files = load_hardlink(decrypted)
     allow_md5 = {hashlib.md5(c.encode()).hexdigest() for c in allow}
 
@@ -761,11 +1225,695 @@ def main() -> int:
         summary["voice_skipped"] = v_skipped
         log(f"[VOICE] ready={v_ready} pending={v_pending} skipped={v_skipped}")
 
+    # ── 图片：离线 V2 AES+XOR 解密 + 变体择优 + 本地 OCR ──────────────────
+    if kinds.get("image"):
+        img_cfg = policy.get("image") or {}
+        max_pixels = int(img_cfg.get("max_pixels") or 50_000_000)
+        wxgf_cfg = img_cfg.get("wxgf") or {}
+        wxgf_animated = wxgf_cfg.get("animated", "skip")
+        ocr_cfg = img_cfg.get("ocr") or {}
+        ocr_enabled = bool(ocr_cfg.get("enabled", True))
+        ocr_providers = tuple(ocr_cfg.get("providers", ["rapidocr", "tesseract"]))
+        ocr_timeout = int(ocr_cfg.get("timeout", 60))
+        img_pending_window = int((policy.get("readiness") or {}).get("max_pending_age_s") or 1800)
+        img_max_retries = int((policy.get("readiness") or {}).get("max_parse_retries") or 2)
+
+        dir2id_img, hl_images = load_image_hardlink(decrypted)
+
+        try:
+            import wechat_image
+        except ImportError:
+            wechat_image = None
+
+        image_keys = None
+        if wechat_image and account_dir:
+            try:
+                image_keys = wechat_image.resolve_keys(
+                    account_dir,
+                    wxid,
+                    templates=None,
+                    allow_sudo=bool(img_cfg.get("allow_sudo_memscan", False)),
+                    cache_path=vault / "state" / "image_keys.json",
+                )
+            except Exception as e:  # noqa: BLE001
+                log(f"[WARN] resolve_keys 失败: {type(e).__name__}: {e}")
+
+        now_ts = time.time()
+        for chat, lid, ct, sender, img_info in iter_image_messages(decrypted, allow_md5, since):
+            if processed >= max_items:
+                log("[INFO] 达到本轮 max_items 上限，收工。")
+                break
+            if daily["parsed"] >= budget:
+                log("[INFO] 今日预算用尽，收工。")
+                break
+
+            key = f"{chat}|{lid}"
+            raw_md5 = img_info.get("md5", "")
+            if not raw_md5:
+                mark(key, None, ct)
+                summary["skipped"] += 1
+                continue
+
+            asset_id = clean_asset_id(raw_md5)
+            chat_name = resolve_chat_name(chat, vault)
+            anchor = {
+                "chat_id": chat,
+                "chat_name": chat_name,
+                "local_id": lid,
+                "ts": ct,
+                "sender": sender,
+            }
+
+            existing = ledger["assets"].get(asset_id)
+            if existing and existing.get("state") in (STATE_READY, STATE_SKIPPED, STATE_FAILED):
+                if existing.get("state") == STATE_READY and "text_head" not in existing:
+                    ocr_info = existing.get("ocr") or {}
+                    if ocr_info.get("status") == "ready" and ocr_info.get("text"):
+                        raw_ocr = str(ocr_info["text"]).strip()
+                        existing["text_head"] = (raw_ocr[:2000] + "…") if len(raw_ocr) > 2000 else raw_ocr
+                    else:
+                        existing["text_head"] = ""
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            if existing and existing.get("state") == STATE_PENDING:
+                attempts = int(existing.get("attempts") or 0)
+                if attempts >= img_max_retries:
+                    existing["state"] = STATE_FAILED
+                    existing["deny_reason"] = "retries_exhausted"
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["failed"] += 1
+                    continue
+
+            hl_entry = hl_images.get(asset_id) or hl_images.get(raw_md5)
+            month = None
+            disk_asset_id = asset_id
+            if hl_entry:
+                disk_asset_id = clean_asset_id(hl_entry[0])
+                month = dir2id_img.get(hl_entry[1]) or dir2id_img.get(hl_entry[2])
+
+            chat_hash = hashlib.md5(chat.encode("utf-8")).hexdigest()
+            candidates, how = find_image_dat(attach_root, cache_root, chat_hash, month, disk_asset_id)
+            if not candidates and disk_asset_id != asset_id:
+                candidates, how = find_image_dat(attach_root, cache_root, chat_hash, month, asset_id)
+            asset_id = disk_asset_id
+
+            existing = ledger["assets"].get(asset_id)
+            if existing and existing.get("state") in (STATE_READY, STATE_SKIPPED, STATE_FAILED):
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+            if not candidates:
+                if how.startswith("unresolved:ambiguous"):
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                        "deny_reason": how, "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["unresolved"] += 1
+                    continue
+
+                if now_ts - ct < img_pending_window:
+                    prev_att = int((existing or {}).get("attempts") or 0)
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_PENDING,
+                        "deny_reason": "image_not_on_disk", "attempts": prev_att + 1,
+                        "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    ledger["by_message"].setdefault(key, asset_id)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    continue
+                else:
+                    rec = {
+                        "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                        "deny_reason": "missing_source", "anchor": anchor, "create_time": ct,
+                    }
+                    ledger["assets"][asset_id] = rec
+                    mark(key, asset_id, ct)
+                    ledger.setdefault("anchors", {})[key] = anchor
+                    summary["skipped"] += 1
+                    continue
+
+            ranked = rank_image_variants(candidates)
+            best_dat = ranked[0]
+            quality = quality_of_path(best_dat)
+            variant = variant_of_path(best_dat)
+            rel_dat_str = (
+                str(best_dat.relative_to(account_dir))
+                if (account_dir and best_dat.is_relative_to(account_dir))
+                else str(best_dat)
+            )
+
+            if args.dry_run:
+                log(f"[DRY] Image {chat} lid={lid} {asset_id} {best_dat.name} ({how}, {quality})")
+                processed += 1
+                continue
+
+            if not wechat_image:
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "skipped:decryptor_unavailable", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            if not image_keys:
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "missing_keys", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            dec = wechat_image.decrypt_dat(best_dat, image_keys)
+            if not dec or not dec.data:
+                prev_att = int((existing or {}).get("attempts") or 0)
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_FAILED,
+                    "deny_reason": "decrypt_failed", "attempts": prev_att + 1,
+                    "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["failed"] += 1
+                continue
+
+            width = dec.width
+            height = dec.height
+            if width and height and (width * height > max_pixels):
+                rec = {
+                    "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                    "deny_reason": "max_pixels_exceeded", "anchor": anchor, "create_time": ct,
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            final_data = dec.data
+            final_fmt = (dec.fmt or "jpg").lower()
+            if final_fmt == "wxgf":
+                staging_png = staging_root / f"{asset_id}.png"
+                staging_png.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    ok, is_anim = wechat_image.convert_wxgf(dec.data, staging_png, animated=wxgf_animated)
+                    if is_anim and wxgf_animated == "skip":
+                        rec = {
+                            "asset_id": asset_id, "kind": "image", "state": STATE_SKIPPED,
+                            "deny_reason": "skipped:animated", "anchor": anchor, "create_time": ct,
+                        }
+                        ledger["assets"][asset_id] = rec
+                        mark(key, asset_id, ct)
+                        ledger.setdefault("anchors", {})[key] = anchor
+                        summary["skipped"] += 1
+                        continue
+                    if not ok or not staging_png.is_file():
+                        rec = {
+                            "asset_id": asset_id, "kind": "image", "state": STATE_FAILED,
+                            "deny_reason": "wxgf_convert_failed", "anchor": anchor, "create_time": ct,
+                        }
+                        ledger["assets"][asset_id] = rec
+                        mark(key, asset_id, ct)
+                        ledger.setdefault("anchors", {})[key] = anchor
+                        summary["failed"] += 1
+                        continue
+                    final_data = staging_png.read_bytes()
+                    final_fmt = "png"
+                finally:
+                    if staging_png.exists():
+                        staging_png.unlink()
+
+            sha256_hex = hashlib.sha256(final_data).hexdigest()
+            ocr_record = {
+                "status": "skipped",
+                "text": "",
+                "provider": "none",
+                "lang": "",
+                "confidence": None,
+                "version": 1,
+                "sha256": sha256_hex,
+            }
+            if ocr_enabled:
+                try:
+                    import wechat_ocr
+                except ImportError:
+                    wechat_ocr = None
+
+                if not wechat_ocr:
+                    ocr_record["status"] = "unavailable"
+                else:
+                    try:
+                        ores = wechat_ocr.ocr_image(final_data, providers=ocr_providers, timeout=ocr_timeout)
+                        ocr_record = {
+                            "status": ores.status,
+                            "text": ores.text,
+                            "provider": ores.provider,
+                            "lang": ores.lang,
+                            "confidence": ores.confidence,
+                            "version": 1,
+                            "sha256": sha256_hex,
+                        }
+                    except Exception as e:  # noqa: BLE001
+                        ocr_record = {
+                            "status": "failed",
+                            "text": "",
+                            "provider": "none",
+                            "lang": "",
+                            "confidence": None,
+                            "version": 1,
+                            "sha256": sha256_hex,
+                            "error": str(e)[:200],
+                        }
+
+            date_dir = out_root / today / asset_id
+            date_dir.mkdir(parents=True, exist_ok=True)
+            export_file = date_dir / f"image.{final_fmt}"
+            export_file.write_bytes(final_data)
+
+            vault_media_dir = vault / "media" / asset_id
+            vault_media_dir.mkdir(parents=True, exist_ok=True)
+            vault_media_file = vault_media_dir / f"image.{final_fmt}"
+            if not vault_media_file.exists():
+                try:
+                    os.link(export_file, vault_media_file)
+                except OSError:
+                    shutil.copy2(export_file, vault_media_file)
+            if ocr_record.get("status") == "ready" and ocr_record.get("text"):
+                raw_ocr = str(ocr_record["text"]).strip()
+                text_head = (raw_ocr[:2000] + "…") if len(raw_ocr) > 2000 else raw_ocr
+            else:
+                text_head = ""
+
+            rec = {
+                "asset_id": asset_id,
+                "kind": "image",
+                "quality": getattr(dec, "quality", None) or quality,
+                "format": final_fmt,
+                "width": width,
+                "height": height,
+                "bytes": len(final_data),
+                "sha256": sha256_hex,
+                "text_head": text_head,
+                "path": f"media/{asset_id}/image.{final_fmt}",
+                "url": f"/api/wechat/media/{asset_id}/image.{final_fmt}",
+                "anchor": anchor,
+                "source": {"dat": rel_dat_str, "variant": variant},
+                "ocr": ocr_record,
+                "state": STATE_READY,
+                "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+            }
+            ledger["assets"][asset_id] = rec
+            mark(key, asset_id, ct)
+            ledger.setdefault("anchors", {})[key] = anchor
+            daily["parsed"] += 1
+            daily["bytes"] += len(final_data)
+            summary["ready"] += 1
+            processed += 1
+            log(f"[OK] Image {chat} lid={lid} {asset_id} -> {export_file} "
+                f"({len(final_data)}B, ocr={ocr_record['status']})")
+    if kinds.get("video"):
+        video_cfg = policy.get("video") or {}
+        video_max_bytes = int(video_cfg.get("max_bytes") or 524_288_000)
+        video_copy_mode = str(video_cfg.get("copy_mode") or "copy")
+        keep_thumb = bool(video_cfg.get("keep_thumb", True))
+        thumb_cfg = video_cfg.get("thumbnail") or {}
+        thumb_mode = str(thumb_cfg.get("mode") or "auto").lower()
+        ffmpeg_timeout = int(thumb_cfg.get("ffmpeg_timeout") or 20)
+        ffmpeg_bin = shutil.which("ffmpeg")
+        video_root = (
+            Path(policy["wechat_video_root"]).expanduser()
+            if policy.get("wechat_video_root")
+            else ((account_dir / "msg" / "video") if account_dir else None)
+        )
+        dir2id_video, hl_video = load_video_hardlink(decrypted)
+
+        try:
+            import wechat_image
+        except ImportError:
+            wechat_image = None
+
+        image_keys = None
+        if wechat_image and account_dir:
+            try:
+                image_keys = wechat_image.resolve_keys(
+                    account_dir,
+                    wxid,
+                    templates=None,
+                    allow_sudo=bool((policy.get("image") or {}).get("allow_sudo_memscan", False)),
+                    cache_path=vault / "state" / "image_keys.json",
+                )
+            except Exception as e:  # noqa: BLE001
+                log(f"[WARN] resolve_keys 失败: {type(e).__name__}: {e}")
+
+        now_ts = time.time()
+        for chat, lid, ct, sender, v_info in iter_video_messages(decrypted, allow_md5, since):
+            if processed >= max_items:
+                log("[INFO] 达到本轮 max_items 上限，收工。")
+                break
+            if daily["parsed"] >= budget:
+                log("[INFO] 今日预算用尽，收工。")
+                break
+
+            key = f"{chat}|{lid}"
+            raw_md5 = v_info.get("md5", "")
+            if not raw_md5:
+                mark(key, None, ct)
+                summary["skipped"] += 1
+                continue
+
+            asset_id = clean_asset_id(raw_md5)
+            chat_name = resolve_chat_name(chat, vault)
+            anchor = {
+                "chat_id": chat,
+                "chat_name": chat_name,
+                "local_id": lid,
+                "ts": ct,
+                "sender": sender,
+            }
+
+            existing = ledger["assets"].get(asset_id)
+            if existing and existing.get("state") in (STATE_READY, STATE_SKIPPED, STATE_FAILED):
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            # Check XML declared length
+            decl_len = int(v_info.get("length") or 0)
+            if decl_len > video_max_bytes:
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "oversize", "format": "mp4", "bytes": decl_len,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": "probe", "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            hl_entry = hl_video.get(asset_id)
+            month = None
+            hl_fn = None
+            if hl_entry:
+                hl_fn = hl_entry[0]
+                month = dir2id_video.get(hl_entry[1]) or dir2id_video.get(hl_entry[2])
+
+            chat_hash = hashlib.md5(chat.encode("utf-8")).hexdigest()
+            src_file: Path | None = None
+            thumb_src: Path | None = None
+            how = "probe"
+
+            if hl_entry and video_root and month and re.fullmatch(r"\d{4}-\d{2}", month):
+                p = video_root / month / hl_fn
+                if p.is_file():
+                    src_file = p
+                    how = "hardlink"
+            if not src_file:
+                src_file, thumb_src, p_how = find_video_source(
+                    video_root, attach_root, chat_hash, month, asset_id
+                )
+                if src_file:
+                    how = "probe"
+                else:
+                    how = p_how
+
+            if not src_file or not src_file.is_file():
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "missing_source", "format": "mp4",
+                    "bytes": decl_len or 0,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": how, "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            # File exists on disk: inspect size and format
+            actual_size = src_file.stat().st_size
+            if actual_size > video_max_bytes:
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "oversize", "format": "mp4", "bytes": actual_size,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": how, "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            video_skip_ext = {e for e in skip_ext if e not in ("mp4", "mov")}
+            ext = src_file.suffix.lstrip(".").lower()
+            if ext in video_skip_ext:
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "ext_denied", "format": ext, "bytes": actual_size,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": how, "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            # Check if file is plaintext mp4 or encrypted .dat
+            head = b""
+            try:
+                with open(src_file, "rb") as fh:
+                    head = fh.read(32)
+            except OSError:
+                pass
+
+            is_plaintext_mp4 = (
+                (len(head) >= 8 and head[4:8] == b"ftyp")
+                or (
+                    wechat_image
+                    and wechat_image.detect_format(head) in ("mp4", "mov")
+                )
+            )
+            is_dat_v1_v2 = (
+                head.startswith(b"\x07\x08V2")
+                or head.startswith(b"\x07\x08V1")
+            )
+
+            # 本机实测实证（2026-10-27，样本 146 个视频）：
+            # Linux 微信接收的视频文件均为明文 MP4
+            # （偏移 4 字节为 66747970 即 'ftyp'），无加密容器。
+            # 以下分支保留作为防御性兼容。
+            if not is_plaintext_mp4 and is_dat_v1_v2:
+                # 加密视频 .dat 容器：保留降级兼容路径（实测未命中）
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "encrypted_video_unverified",
+                    "format": "mp4",
+                    "bytes": actual_size,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": how, "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            if not is_plaintext_mp4:
+                # Unknown binary format
+                rec = {
+                    "md5": asset_id, "kind": "video", "state": STATE_SKIPPED,
+                    "deny_reason": "encrypted_video_unverified", "format": "mp4",
+                    "bytes": actual_size,
+                    "duration_s": int(v_info.get("playlength") or 0) or None,
+                    "width": None, "height": None,
+                    "path": None, "thumb": None,
+                    "anchor": anchor, "source": how, "create_time": ct,
+                    "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                    "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+                }
+                ledger["assets"][asset_id] = rec
+                mark(key, asset_id, ct)
+                ledger.setdefault("anchors", {})[key] = anchor
+                summary["skipped"] += 1
+                continue
+
+            # Plaintext MP4: stage/export
+            date_dir = out_root / today / asset_id
+            date_dir.mkdir(parents=True, exist_ok=True)
+            export_video = date_dir / "video.mp4"
+
+            if video_copy_mode == "hardlink":
+                try:
+                    if export_video.exists():
+                        export_video.unlink()
+                    os.link(src_file, export_video)
+                except OSError:
+                    shutil.copy2(src_file, export_video)
+            else:
+                shutil.copy2(src_file, export_video)
+            vault_media_dir = vault / "media" / asset_id
+            vault_media_dir.mkdir(parents=True, exist_ok=True)
+            vault_video = vault_media_dir / "video.mp4"
+            if not vault_video.exists():
+                try:
+                    os.link(export_video, vault_video)
+                except OSError:
+                    shutil.copy2(export_video, vault_video)
+
+            # Parse metadata
+            w, h, dur = None, None, None
+            if wechat_image and hasattr(wechat_image, "parse_mp4_metadata"):
+                try:
+                    with open(export_video, "rb") as fh:
+                        mp4_head = fh.read(1024 * 1024)
+                    w, h, dur = wechat_image.parse_mp4_metadata(mp4_head)
+                except Exception:
+                    pass
+
+            final_duration = dur or int(v_info.get("playlength") or 0) or None
+            final_width = w
+            final_height = h
+
+            # Handle thumbnail
+            thumb_rel_path: str | None = None
+            thumb_error: str | None = None
+
+            # 1. WeChat native thumbnail (preferred when mode is auto/wechat)
+            if keep_thumb and thumb_mode in ("auto", "wechat") and thumb_src:
+                if thumb_src.is_file() and wechat_image and image_keys:
+                    dec_thumb = wechat_image.decrypt_dat(thumb_src, image_keys)
+                    if dec_thumb and dec_thumb.data:
+                        thumb_export = date_dir / "thumb.jpg"
+                        thumb_export.write_bytes(dec_thumb.data)
+                        thumb_rel_path = f"media/{today}/{asset_id}/thumb.jpg"
+                        vault_thumb = vault_media_dir / "thumb.jpg"
+                        if not vault_thumb.exists():
+                            try:
+                                os.link(thumb_export, vault_thumb)
+                            except OSError:
+                                shutil.copy2(thumb_export, vault_thumb)
+
+            # 2. ffmpeg frame extraction fallback (if mode is auto or ffmpeg)
+            need_ffmpeg = (
+                keep_thumb
+                and (
+                    (thumb_mode == "auto" and thumb_rel_path is None)
+                    or thumb_mode == "ffmpeg"
+                )
+            )
+            if need_ffmpeg:
+                if not ffmpeg_bin:
+                    thumb_error = "no_ffmpeg"
+                else:
+                    thumb_export = date_dir / "thumb.jpg"
+                    cmd = [
+                        ffmpeg_bin,
+                        "-nostdin",
+                        "-loglevel", "error",
+                        "-ss", "1",
+                        "-i", str(export_video),
+                        "-frames:v", "1",
+                        "-vf", "scale='min(720,iw)':-2",
+                        "-y", str(thumb_export),
+                    ]
+                    try:
+                        res = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            timeout=ffmpeg_timeout,
+                        )
+                        if res.returncode == 0 and thumb_export.is_file():
+                            thumb_rel_path = (
+                                f"media/{today}/{asset_id}/thumb.jpg"
+                            )
+                            vault_thumb = vault_media_dir / "thumb.jpg"
+                            if not vault_thumb.exists():
+                                try:
+                                    os.link(thumb_export, vault_thumb)
+                                except OSError:
+                                    shutil.copy2(thumb_export, vault_thumb)
+                        else:
+                            thumb_error = "failed"
+                    except subprocess.TimeoutExpired:
+                        thumb_error = "timeout"
+                    except Exception:
+                        thumb_error = "failed"
+            rel_video_path = f"media/{today}/{asset_id}/video.mp4"
+
+            rec = {
+                "md5": asset_id,
+                "kind": "video",
+                "state": STATE_READY,
+                "deny_reason": None,
+                "format": "mp4",
+                "bytes": actual_size,
+                "duration_s": final_duration,
+                "width": final_width,
+                "height": final_height,
+                "path": rel_video_path,
+                "thumb": thumb_rel_path,
+                "thumb_error": thumb_error,
+                "anchor": anchor,
+                "source": "hardlink" if how == "hardlink" else "probe",
+                "create_time": ct,
+                "attempts": int((existing or {}).get("attempts") or 0) + 1,
+                "parsed_at": datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds"),
+            }
+            ledger["assets"][asset_id] = rec
+            mark(key, asset_id, ct)
+            ledger.setdefault("anchors", {})[key] = anchor
+            daily["parsed"] += 1
+            daily["bytes"] += actual_size
+            summary["ready"] += 1
+            processed += 1
+            log(f"[OK] Video {chat} lid={lid} {asset_id} -> {export_video} ({actual_size}B)")
+
     ledger["watermark"] = max(int(ledger.get("watermark") or 0), settled_max)
     ledger["updated_at"] = datetime.now(SHANGHAI_TZ).isoformat(timespec="seconds")
     if not args.dry_run:
         save_json_atomic(ledger_path, ledger)
     log(f"[DONE] {summary} daily={daily} watermark={ledger['watermark']}")
+    lock_fh.close()
     return 0
 
 

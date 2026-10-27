@@ -1,0 +1,74 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_OCR: "0"
+    image: wx-linux-exporter:latest
+    container_name: wx-exporter-api
+    profiles:
+      - api
+    restart: unless-stopped
+    read_only: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WECHAT_VAULT_ROOT=/vault
+      - WECHAT_MEDIA_POLICY=/vault/config/media_policy.json
+      - WECHAT_MEDIA_LEDGER=/vault/state/media_ledger.json
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8765"
+      - "--vault-dir"
+      - "/vault/decrypted/current"
+      - "--token"
+      - "${WECHAT_TOKEN:?WECHAT_TOKEN environment variable must be explicitly set}"
+    volumes:
+      # Read-only mounts for decrypted vault and configuration (prevents data corruption)
+      - "${WECHAT_VAULT_HOST_DIR:-~/.local/share/wechat-vault}:/vault:ro"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_OCR: "0"
+    image: wx-linux-exporter:latest
+    container_name: wx-exporter-worker
+    profiles:
+      - worker
+    restart: unless-stopped
+    read_only: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WECHAT_VAULT_ROOT=/vault
+      - WECHAT_MEDIA_POLICY=/vault/config/media_policy.json
+      - WECHAT_MEDIA_LEDGER=/vault/state/media_ledger.json
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        while true; do
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Running wxmedia sync...";
+          wxmedia --policy /vault/config/media_policy.json --vault /vault || true;
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Sleeping 300s before next iteration...";
+          sleep 300;
+        done
+    volumes:
+      # Read-only mount for input decrypted data and media configs
+      - "${WECHAT_VAULT_HOST_DIR:-~/.local/share/wechat-vault}:/vault:ro"

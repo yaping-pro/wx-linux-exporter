@@ -1,0 +1,719 @@
+openapi: 3.1.0
+info:
+  title: WeChat Export API
+  version: 1.3.1
+  description: >-
+    Standalone HTTP read-only service for exporting decrypted WeChat message archives,
+    enriched media assets, and homelab health briefing snapshots. Conforms to the
+    Muse WeChat Export Specification and Data Contract v1.3.1.
+servers:
+  - url: http://127.0.0.1:8765
+    description: Local loopback server
+  - url: http://linux1:8765
+    description: Tailscale homelab private node
+
+security:
+  - BearerAuth: []
+
+paths:
+  /api/wechat/export:
+    get:
+      summary: Export WeChat messages
+      description: >-
+        Query and export decrypted WeChat messages within a specified time range,
+        with optional media filtering, OCR projection modes, cursor-based pagination,
+        and ndjson streaming output.
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Start of query window as epoch seconds or RFC3339 string. Default is now - 86400 (past 24h).
+          schema:
+            type: string
+            example: "1759000000"
+        - name: to
+          in: query
+          required: false
+          description: End of query window as epoch seconds or RFC3339 string. Default is now.
+          schema:
+            type: string
+            example: "1759000500"
+        - name: media
+          in: query
+          required: false
+          description: Media enrichment filter controlling injection of structured media objects.
+          schema:
+            type: string
+            enum: [none, image, video, all]
+            default: all
+        - name: media_chats
+          in: query
+          required: false
+          description: Comma-separated list of chat_ids to restrict media injection to.
+          schema:
+            type: string
+            example: "wxid_alice,wxid_bob"
+        - name: ocr
+          in: query
+          required: false
+          description: OCR mode controlling OCR projection in text and media.ocr object.
+          schema:
+            type: string
+            enum: [none, head, full]
+            default: head
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of messages to return in this response (0 = unlimited).
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque base64url-encoded continuation cursor {"ts":int,"chat_id":str,"local_id":int}.
+          schema:
+            type: string
+        - name: format
+          in: query
+          required: false
+          description: Response format serialization.
+          schema:
+            type: string
+            enum: [json, ndjson]
+            default: json
+      responses:
+        "200":
+          description: Successful export snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportResponse"
+            application/x-ndjson:
+              schema:
+                type: string
+                description: >-
+                  Streaming newline-delimited JSON. First row is {"type":"manifest",...},
+                  followed by {"type":"chat",...} and {"type":"message",...} rows,
+                  and terminated by {"type":"end","next_cursor":...,"payload_stats":{...}}.
+        "400":
+          description: Invalid request parameters or malformed cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid Bearer authentication token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Server internal error during export generation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wechat/media:
+    get:
+      summary: Search media assets
+      description: Query indexed and enriched media assets (images and videos) with OCR text search, chat filtering, and optional context.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Substring search across OCR text.
+          schema:
+            type: string
+        - name: chat_id
+          in: query
+          required: false
+          description: Filter by specific chat ID.
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          description: Minimum timestamp (epoch seconds or RFC3339).
+          schema:
+            type: string
+        - name: until
+          in: query
+          required: false
+          description: Maximum timestamp (epoch seconds or RFC3339).
+          schema:
+            type: string
+        - name: quality
+          in: query
+          required: false
+          description: Filter by image quality variant (e.g. hd, full, mid, thumb).
+          schema:
+            type: string
+        - name: kind
+          in: query
+          required: false
+          description: Comma-separated media kinds to match.
+          schema:
+            type: string
+            default: "image,video"
+            example: "image,video"
+        - name: include
+          in: query
+          required: false
+          description: Comma-separated extra attributes to include, e.g. 'context'.
+          schema:
+            type: string
+            example: "context"
+        - name: limit
+          in: query
+          required: false
+          description: Number of items to return (1-100, or 1-50 when include=context). Default is 20.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Matched media asset list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaSearchResponse"
+        "400":
+          description: Invalid limit, offset, or time parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/wechat/media/{asset_id}/{filename}:
+    get:
+      summary: Download media asset binary
+      description: >-
+        Retrieve raw media binary (JPEG, PNG, MP4, etc.) for a specific asset.
+        Supports ETag caching (304 Not Modified) and HTTP byte ranges (206 Partial Content)
+        for audio/video streaming.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          description: 32-hex character asset MD5 identifier.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+        - name: filename
+          in: path
+          required: true
+          description: Filename including extension (jpg, jpeg, png, gif, webp, mp4, mov).
+          schema:
+            type: string
+        - name: Range
+          in: header
+          required: false
+          description: Standard HTTP byte range request header (e.g. bytes=0-1023).
+          schema:
+            type: string
+            example: "bytes=0-1048575"
+        - name: If-None-Match
+          in: header
+          required: false
+          description: Client ETag for cache validation.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Full media binary payload.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: "image/jpeg"
+            Content-Length:
+              schema:
+                type: integer
+            ETag:
+              schema:
+                type: string
+                example: '"d41d8cd98f00b204e9800998ecf8427e"'
+            Accept-Ranges:
+              schema:
+                type: string
+                example: "bytes"
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/gif:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+            video/quicktime:
+              schema:
+                type: string
+                format: binary
+        "206":
+          description: Partial content for HTTP Range request.
+          headers:
+            Content-Range:
+              schema:
+                type: string
+                example: "bytes 0-1023/2048"
+            Content-Length:
+              schema:
+                type: integer
+            Content-Type:
+              schema:
+                type: string
+                example: "video/mp4"
+            ETag:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+                example: "bytes"
+          content:
+            video/mp4:
+              schema:
+                type: string
+                format: binary
+            video/quicktime:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: Not Modified (ETag match).
+          headers:
+            ETag:
+              schema:
+                type: string
+        "400":
+          description: Invalid filename, extension, or range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Forbidden (path traversal or permission restriction).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Asset or media file not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "416":
+          description: Requested Range Not Satisfiable.
+          headers:
+            Content-Range:
+              schema:
+                type: string
+                example: "bytes */2048"
+
+  /api/health/briefing:
+    get:
+      summary: Retrieve homelab health briefing snapshot
+      description: Fetches daily inspection briefing snapshot with machine metrics and status summaries. Requires Bearer authentication.
+      responses:
+        "200":
+          description: Current briefing snapshot JSON document.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Failed to read briefing snapshot file.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Briefing snapshot not available yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Token
+      description: Bearer token authentication required for data egress endpoints.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          oneOf:
+            - type: string
+              example: "Unauthorized"
+            - type: object
+              required:
+                - code
+                - message
+              properties:
+                code:
+                  type: string
+                  example: "invalid_param"
+                message:
+                  type: string
+                  example: "Invalid limit parameter: '-1'"
+                hint:
+                  type: string
+                  example: "limit must be a non-negative integer (0 = unlimited)"
+
+    ExportResponse:
+      type: object
+      required:
+        - exported_at
+        - range
+        - watermark
+        - chats
+        - manifest
+        - payload_stats
+      properties:
+        exported_at:
+          type: string
+          format: date-time
+          example: "2026-10-27T09:30:00+08:00"
+        range:
+          type: object
+          required:
+            - from
+            - to
+          properties:
+            from:
+              type: string
+              format: date-time
+              example: "2026-10-26T09:30:00+08:00"
+            to:
+              type: string
+              format: date-time
+              example: "2026-10-27T09:30:00+08:00"
+        watermark:
+          type: string
+          format: date-time
+          example: "2026-10-27T09:28:15+08:00"
+        next_cursor:
+          type:
+            - string
+            - "null"
+          description: Base64url encoded cursor for the next page, or null if no further messages remain.
+          example: "eyJ0cyI6MTc1OTAwMDMwMCwiY2hhdF9pZCI6Ind4aWRfYWxpY2UiLCJsb2NhbF9pZCI6M30"
+        chats:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatItem"
+        manifest:
+          type: object
+          required:
+            - sha256
+            - message_count
+          properties:
+            sha256:
+              type: string
+              pattern: "^[0-9a-f]{64}$"
+            message_count:
+              type: integer
+              minimum: 0
+        payload_stats:
+          $ref: "#/components/schemas/PayloadStats"
+
+    PayloadStats:
+      type: object
+      required:
+        - messages
+        - media_included
+        - ocr_chars
+      properties:
+        messages:
+          type: integer
+          minimum: 0
+        media_included:
+          type: integer
+          minimum: 0
+        ocr_chars:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+          description: True if response was truncated by limit and more messages remain.
+
+    ChatItem:
+      type: object
+      required:
+        - name
+        - kind
+        - messages
+      properties:
+        chat_id:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [single, group]
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/MessageItem"
+
+    MessageItem:
+      type: object
+      required:
+        - ts
+        - sender
+        - kind
+        - text
+        - note
+      properties:
+        ts:
+          type: string
+          format: date-time
+        sender:
+          type: string
+        kind:
+          type: string
+          enum: [text, image, voice, video, link, file, other]
+        text:
+          type: string
+        note:
+          type: string
+        media:
+          $ref: "#/components/schemas/MediaObject"
+
+    MediaAnchor:
+      type: object
+      required:
+        - chat_id
+        - chat_name
+        - local_id
+        - ts
+        - sender
+      properties:
+        chat_id:
+          type: string
+        chat_name:
+          type: string
+        local_id:
+          type: integer
+        ts:
+          type: integer
+        sender:
+          type: string
+
+    MediaOcr:
+      type: object
+      required:
+        - status
+        - text
+        - provider
+        - confidence
+      properties:
+        status:
+          type: string
+          enum: [ready, skipped, failed]
+        text:
+          type: string
+        provider:
+          type: string
+        confidence:
+          type:
+            - number
+            - "null"
+        lang:
+          type: string
+        version:
+          type: string
+
+    MediaObject:
+      type: object
+      required:
+        - asset_id
+        - kind
+        - format
+        - bytes
+        - width
+        - height
+        - url
+        - anchor
+        - source
+      properties:
+        asset_id:
+          type: string
+          pattern: "^[0-9a-f]{32}$"
+        kind:
+          type: string
+          enum: [image, video]
+        format:
+          type: string
+          enum: [jpg, jpeg, png, gif, webp, mp4, mov]
+        bytes:
+          type: integer
+          minimum: 0
+        width:
+          type:
+            - integer
+            - "null"
+        height:
+          type:
+            - integer
+            - "null"
+        url:
+          type: string
+        anchor:
+          $ref: "#/components/schemas/MediaAnchor"
+        source:
+          type: string
+        quality:
+          type: string
+          enum: [hd, full, mid, thumb]
+        ocr:
+          $ref: "#/components/schemas/MediaOcr"
+        duration_s:
+          type:
+            - number
+            - "null"
+        poster:
+          type:
+            - string
+            - "null"
+
+    MediaSearchResponse:
+      type: object
+      required:
+        - items
+        - total
+        - limit
+        - offset
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/MediaSearchItem"
+        total:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    MediaSearchItem:
+      type: object
+      required:
+        - asset_id
+        - anchor
+        - format
+        - width
+        - height
+        - bytes
+        - url
+      properties:
+        asset_id:
+          type: string
+        anchor:
+          $ref: "#/components/schemas/MediaAnchor"
+        format:
+          type: string
+        width:
+          type:
+            - integer
+            - "null"
+        height:
+          type:
+            - integer
+            - "null"
+        bytes:
+          type: integer
+        url:
+          type: string
+        quality:
+          type: string
+        ocr:
+          type: object
+          additionalProperties: true
+        duration_s:
+          type:
+            - number
+            - "null"
+        poster:
+          type:
+            - string
+            - "null"
+        context:
+          type: object
+          properties:
+            before:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContextMessage"
+            after:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContextMessage"
+
+    ContextMessage:
+      type: object
+      required:
+        - ts
+        - sender
+        - text
+      properties:
+        ts:
+          type: string
+        sender:
+          type: string
+        text:
+          type: string

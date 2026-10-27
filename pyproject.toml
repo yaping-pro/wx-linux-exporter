@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wx-linux-exporter"
+version = "1.4.0"
+description = "Non-invasive read-only decryption, incremental WAL merge, and HTTP/Webhook export pipeline for Linux native WeChat 4.x"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Steven Ma", email = "mayaping@proton.me"},
+]
+keywords = [
+    "wechat",
+    "linux",
+    "exporter",
+    "decrypt",
+    "sqlite",
+    "wal",
+    "webhook",
+    "media-enrichment",
+    "ocr",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Topic :: Database",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pycryptodome>=3.19.0",
+]
+
+[project.optional-dependencies]
+ocr = [
+    "rapidocr_onnxruntime>=1.2.3",
+    "Pillow>=10.0.0",
+]
+zstd = [
+    "zstandard>=0.22.0",
+]
+dev = [
+    "flake8>=7.0.0",
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yaping-pro/wx-linux-exporter"
+Documentation = "https://github.com/yaping-pro/wx-linux-exporter#readme"
+Repository = "https://github.com/yaping-pro/wx-linux-exporter.git"
+Issues = "https://github.com/yaping-pro/wx-linux-exporter/issues"
+Changelog = "https://github.com/yaping-pro/wx-linux-exporter/blob/main/CHANGELOG.md"
+
+[project.scripts]
+wxexport = "wechat_export_api:main"
+wxmedia = "wechat_media:main"
+wxbridge = "clients.assistant_webhook:main"
+wxprobe = "clients.muse_probe:main"
+
+[tool.setuptools]
+package-dir = {"" = "bin", "clients" = "clients"}
+packages = ["clients"]
+py-modules = [
+    "wechat_export_api",
+    "wechat_media",
+    "wechat_image",
+    "wechat_ocr",
+    "wx_contract",
+    "wx_store",
+    "wechat_shards",
+    "wechat_schema",
+    "wechat_wal",
+    "wechat_publish",
+    "wechat_digest",
+    "mineru_agent",
+    "snapshot_reader",
+    "vault_cli",
+    "search_sns",
+    "list_contacts",
+    "extract_keys",
+    "export_chat",
+    "decrypt_all_dbs",
+]

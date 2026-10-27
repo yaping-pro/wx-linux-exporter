@@ -4,6 +4,9 @@
 *.dex
 *.class
 gen/
+.venv/
+*.egg-info/
+dist/
 out/
 build/
 .gradle/
