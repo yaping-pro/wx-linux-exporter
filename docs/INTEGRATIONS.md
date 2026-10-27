@@ -231,54 +231,106 @@ python3 clients/muse_probe.py --dry-run --input /tmp/wechat_export.json --limit 
 ```
 
 #### 第三步：语义层打分 (`--score`)
-通过手写探针集 `probes.json`，把带图会话上下文投递到待测 AI 助手 Webhook，验证模型理解的准确度并严格防范幻觉：
+通过探针集 `probes.json`，把带图会话上下文投递到待测 AI 助手 Webhook，验证模型理解的准确度并严格防范幻觉。
 
-`probes.json` 配置示例：
+> ⚠️ **定位与边界（重要契约）**：  
+> `--score` 属于 **Prompt 构造回归与富化元数据问答契约测试，不验证视觉理解**。`--score` 仅校验探针集自身可用、Schema 结构合法，以及测试下游 Agent 能否基于消息富化文本（如导出侧本地 OCR 文本 `ocr.text` 与会话锚点 `anchor`）按关键词如实回答且不产生幻觉。  
+> **真正验证视觉理解必须使用 `--vision` 输出的多模态载荷 + 真实解密图片/视频海报 + 具备 Vision 视觉能力的端到端大模型**（详见 5.3 节）。
+#### 5.2.1 自建探针集规范与字段定义
+探针集文件为 JSON 数组，位于 `probes/probes.json`。每条用例包含以下字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `id` | `string` | 建议 | 探针用例唯一标识（如 `probe_01_text_table`） |
+| `type` | `string` | 建议 | 用例类型标签（`text_table`, `pure_photo`, `chat_context`, `counter_hallucination`, `video_first_frame`） |
+| `asset_id` | `string` | **是** | 目标媒体资产 32 位十六进制 MD5 指纹（与导出载荷中的 `media.asset_id` 精确对齐） |
+| `question` | `string` | **是** | 驱动待测 AI 模型/Webhook 评测的具体问题 |
+| `must_contain` | `string[]` | 否 | 期望回答必须包含的关键词列表；全命中记 `hit`，部分命中记 `partial` |
+| `must_not_contain` | `string[]` | 否 | 防幻觉禁止词；回答包含任一词即被判定为幻觉 `hallucination` |
+| `expect_empty` | `boolean` | 否 | 是否期望无文字或纯画面回答（默认 `false`）；为 `true` 时执行空内容与幻觉检测 |
+| `description` | `string` | 否 | 该条探针的测试意图与验收标准说明 |
+
+##### 5 类典型探针用例设计原则：
+1. **文字图（表格/通知/发票单据）**：针对图内文字提问具体字段（如值班人、生效日期），`must_contain` 设为核心提取关键词；
+2. **纯照片（风景/静物）**：画面无文字，设置 `expect_empty: true`，并将 `must_not_contain` 设为容易被大模型幻觉编造的事物（如 `"发票"`, `"金额"`, `"身份证号"`）；
+3. **群聊上下文**：问题询问"这是哪个群在聊什么/谁发的消息"，验证模型是否正确理解会话锚点（`chat_name`, `sender`, `ts`）；
+4. **反例/防幻觉**：故意询问图中不存在的字段（如报销金额、快递单号），期望模型回答"未提及"或"图中没有"，严禁瞎编数值；
+5. **视频首帧**：针对视频首帧/海报图提问，验证视频消息的视觉理解链路。
+
+`probes/probes.json` 片段示例：
 ```json
 [
   {
-    "asset_id": "3a7b9c1d2e3f4a5b6c7d8e9f0a1b2c3d",
-    "question": "这张图里说了什么？",
-    "must_contain": ["解约", "家庭医生"]
+    "id": "probe_01_text_table",
+    "type": "text_table",
+    "asset_id": "10000000000000000000000000000001",
+    "question": "表格中周三夜班的值班人员是谁？值班地点在何处？",
+    "must_contain": ["周三", "王工", "主控机房"],
+    "must_not_contain": ["发票", "报销"],
+    "expect_empty": false,
+    "description": "排班表格OCR文字识别与关键词提取"
   },
   {
-    "asset_id": "8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
-    "question": "这张图有文字吗？",
+    "id": "probe_04_photo_landscape",
+    "type": "pure_photo",
+    "asset_id": "20000000000000000000000000000001",
+    "question": "这张户外植物照片中能识别出哪些文字内容？",
     "must_contain": [],
-    "expect_empty": true
+    "must_not_contain": ["发票", "金额", "身份证号", "文字："],
+    "expect_empty": true,
+    "description": "纯风景照片无文字检测防幻觉"
   }
 ]
 ```
 
-运行评分命令：
+#### 5.2.2 质量门禁与退出码参数
+
+探针内置了质量门禁与机器可读输出，便于无缝嵌入 CI/CD 流水线：
+- `--fail-under <float>`（默认 `0.8`）：设置综合命中率通过阈值（0.0 ~ 1.0）。综合命中率计算规则为：`composite_rate = (hits + 0.5 * partials) / total`。若综合命中率低于此阈值，命令退出码为 `1`；
+- `--require-zero-hallucination`：严格零幻觉门禁。只要产生任意 1 条幻觉命中，立即判定失败并退出码 `1`；
+- **机器可读输出行**：在命令输出的最末行固定打印标准单行，格式为：  
+  `SCORE: pass|fail hit=<x> partial=<y> hallu=<z> total=<n>`
+
+运行真实评分命令示例：
 ```bash
 python3 clients/muse_probe.py \
   --score \
   --input /tmp/wechat_export.json \
-  --expect probes.json \
+  --expect probes/probes.json \
   --webhook-url "http://127.0.0.1:9000/webhook/wechat" \
-  --webhook-type "custom"
+  --webhook-type "custom" \
+  --fail-under 0.8 \
+  --require-zero-hallucination
 ```
 
-**期望输出示例**：
+输出示例：
 ```text
 === Semantic Probe Score Summary ===
-Total Probes:       2
-Hit Rate:           100.0% (2/2)
+Total Probes:       12
+Hit Rate:           91.7% (11/12)
 Hallucinations:     0
 Grounding Accuracy: 100.0%
 OVERALL:            PASS
 
 Details:
---- Probe #1 [PASS] (asset=3a7b9c1d2e3f...) ---
-Question: 这张图里说了什么？
-Must Contain: ['解约', '家庭医生']
-Answer: 这是一张家庭医生解约协议的通知单...
---- Probe #2 [PASS] (asset=8e9f0a1b2c3d...) ---
-Question: 这张图有文字吗？
-Expect Empty: True, Hallucination: False (ok)
-Answer: 图中是一张风景照片，没有检测到文字内容。
+--- Probe #1 [PASS] (asset=100000000000...) ---
+...
+
+SCORE: pass hit=11 partial=1 hallu=0 total=12
 ```
+
+#### 5.2.3 CI 门禁与离线自检理由
+
+在 GitHub Actions CI 流水线中，采用离线自检模式：
+```bash
+python3 clients/muse_probe.py --score --expect probes/probes.json --dry-run --fail-under 0.0
+```
+
+**为什么 CI 中只做 `--dry-run` 离线自检，而不跑联网真实评分？**
+1. **确定性与抗抖动 (Determinism)**：大模型推理输出存在非确定性，外部 Webhook 亦受网络延时影响。将真实打分放入 CI 会导致偶发超时或输出波动，引入不可控的构建抖动（Flaky CI）；
+2. **凭据安全与零泄露 (Secret Hygiene)**：离线自检无需注入任何下游 AI 平台的 API Token 或生产 Webhook 凭据，消除 GitHub Actions 环境的密钥外泄风险；
+3. **资源成本节约 (Zero Inference Cost)**：日常 Git 提交与 PR 验证频繁，离线校验避免产生不必要的外部 LLM 推理调用与 Token 计费消耗；
+4. **结构契约守护 (Schema Gate)**：CI 的核心目标是验证代码质量与静态资产完好性。`--dry-run` 会严格解析 `probes/probes.json`，检查条目数是否达标（≥12 条）、字段结构与格式是否合法，并模拟载荷组装，确保探针集资产不发生意外损坏。端到端语义打分则安排在生产发布前或准入验证环节按需执行。
 
 ### 5.3 Muse 多模态视觉接入 (Vision Recipe)
 
@@ -310,6 +362,41 @@ python3 clients/muse_probe.py --vision --input /tmp/wechat_export.json --image-d
 python3 clients/muse_probe.py --vision --input /tmp/wechat_export.json --no-base64 --public-base-url "http://192.168.1.100:8765"
 ```
 
+
+### 5.3.1 视频首帧进多模态与 `--video-mode`
+
+在微信消息流中，视频通常体积较大（MB~GB 级别），直接对视频本体做 base64 内联投递至大语言模型不仅浪费传输带宽，且极易导致上下文窗口溢出或网关超时。
+
+为此，探针 `--vision` 针对视频消息提供了**首帧海报（Poster）多模态投递机制**。通过 `--video-mode {poster,url,both}`（默认 `poster`）控制：
+
+#### 三种 `--video-mode` 载荷差异
+| 模式 (`--video-mode`) | Text 部分 | Image/Vision 部分 | 适用场景 |
+|:---|:---|:---|:---|
+| `poster`（默认） | 说明为视频首帧（含时长）与视频本体 URL（若本地无首帧则提示无首帧需自行抽帧） | 首帧图片（本地存在则 base64 内联 `image_url`） | 默认多模态视觉问答，模型主要理解视频首帧静态信息 |
+| `url` | 仅输出 `media_url_abs` 视频下载链接（含时长，提示需 Bearer 鉴权） | 无（不投递 `image_url`） | 纯链接通知、消费端已有外部视频解析器链路 |
+| `both` | 说明为首帧与本体 URL，并在尾部追加独立视频链接块 | 首帧图片（本地存在则 base64 内联 `image_url`） | 既需要模型看首帧图，又需要下游 Agent 接收直接视频直链 |
+
+> ⚠️ **视频本体永不 base64**：无论何种模式，视频文件均保持 URL 外部拉取，不内联进 JSON。
+
+#### 首帧与视频内容提示及自行抽帧建议
+**首帧 ≠ 完整视频内容**：长视频首帧往往为黑屏、转场过渡或封面片头，信息量有限。若业务对视频全片理解有硬性要求，消费端应根据 `media_url_abs` 携带 Bearer Token 下载视频，并使用 `ffmpeg` 自行抽帧：
+
+```bash
+# 从远程 API 下载并按每 2 秒抽取一帧示例
+curl -H "Authorization: Bearer <TOKEN>" -o /tmp/video.mp4 "<media_url_abs>"
+ffmpeg -i /tmp/video.mp4 -vf "fps=1/2" -q:v 2 /tmp/frame_%03d.jpg
+```
+
+#### Muse 早报/多模态集成推荐组合
+```bash
+python3 clients/muse_probe.py \
+  --vision \
+  --only video \
+  --video-mode poster \
+  --input /tmp/wechat_export.json \
+  --image-dir /tmp/exports
+```
+结合 Webhook 导出参数推荐：`--only video --video-mode poster --media=video --ocr=none`。
 ---
 
 ### 5.4 按需拉取与体积控制 (On-demand Slicing & Byte Estimation)

@@ -51,16 +51,21 @@ jobs:
           export PYTHONPATH="$PWD:${PYTHONPATH:-}"
           for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
 
+      - name: Probe suite structure check
+        run: python3 clients/muse_probe.py --score --expect probes/probes.json --dry-run --fail-under 0.0
+
   docker-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Validate Docker Compose Config
+      - name: Validate Docker Compose Config (API & Worker profiles)
         env:
           WECHAT_TOKEN: "ci_test_token_0123456789abcdef"
+          WECHAT_VAULT_HOST_DIR: "/tmp/fake_vault"
         run: |
-          docker compose config
+          docker compose --profile api config
+          docker compose --profile worker config
 
       - name: Build Docker image (standard)
         run: |

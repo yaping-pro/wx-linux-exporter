@@ -6,13 +6,15 @@
 
 ## 核心安全设计约束
 
-1. **只读挂载 (`:ro`)**：容器对微信解密数据库及媒体目录采用严格只读访问，保证宿主机数据绝对安全，绝无覆写损坏风险。
+1. **最小权限细粒度挂载**：容器采用按目录最小授权原则，严格分离只读快照输入与可写状态输出，绝不将整个 Vault 目录整盘赋予写权限：
+   - 敏感只读项（`:ro`）：`decrypted/`、`config/`（防止微信历史快照被篡改）；
+   - 业务可写项（`:rw`，仅限 Worker 服务）：`state/`、`media/`、`exports/`、`staging/`；
+   - `api` 导出服务维持全只读挂载（`:ro`）。
 2. **非 Root 运行**：镜像默认采用 UID 1000（`USER 1000:1000`），可通过环境变量 `PUID`/`PGID` 自定义映射。配合 `read_only: true` 只读根文件系统与内存级 `tmpfs: /tmp`。
 3. **密钥零落盘**：鉴权 Token 严格通过环境变量 `WECHAT_TOKEN` 显式注入；Docker Compose 配置使用 `${WECHAT_TOKEN:?}` 强校验，未配置拒绝启动。
 4. **监听回环绑定**：容器内部监听 `0.0.0.0:8765`，宿主机端口严格绑定为 `127.0.0.1:8765:8765`，防止暴露到局域网或公网。
 5. **极简轻量镜像**：基于 `python:3.12-slim` 多阶段构建，仅安装必需运行时依赖（`pycryptodome`、`zstandard`）；OCR（RapidOCR + ONNXRuntime）支持按需构建。
-6. **无外部定时依赖**：媒体富化 Worker 使用轻量 shell 循环（`sleep 300`），无需引入 cron 或复杂守护进程。
-
+6. **无外部定时依赖**：媒体富化 Worker 使用轻量 shell 循环（`sleep 300`），无隐藏失败吞噬，标准输出明确打印 `exit=$?` 状态。
 ---
 
 ## ⚡ 三步极速跑起来
@@ -26,15 +28,14 @@
 export WECHAT_TOKEN=$(openssl rand -hex 32)
 echo "生成的 Token: ${WECHAT_TOKEN}"
 
-# （可选）若微信数据不在 ~/.local/share/wechat-vault，指定宿主机路径：
-export WECHAT_VAULT_HOST_DIR=~/.local/share/wechat-vault
-```
+# （可选）若微信数据不在 ${HOME}/.local/share/wechat-vault，指定宿主机路径：
+export WECHAT_VAULT_HOST_DIR="${HOME}/.local/share/wechat-vault"
 
 ### 步骤 2：启动 API 导出服务
 
 ```bash
-# 仅启动导出 API 服务（api profile）
-docker compose --profile api up -d --build
+# 仅启动导出 API 服务（api profile，自动从 GHCR 拉取预构建镜像）
+docker compose --profile api up -d
 ```
 
 ### 步骤 3：验证运行状态
@@ -51,6 +52,54 @@ curl -s -H "Authorization: Bearer ${WECHAT_TOKEN}" \
 
 ---
 
+## 镜像来源与更新 (GHCR)
+
+项目通过 GitHub Container Registry (GHCR) 提供官方自动化构建的多架构镜像：
+
+```
+ghcr.io/yaping-pro/wx-linux-exporter:latest
+```
+
+### 1. 多架构支持
+每批次镜像均由 CI 基于原生/QEMU 环境交叉编译，同时发布并验证两种硬件架构：
+- `linux/amd64`：标准 x86_64 服务器与 PC
+- `linux/arm64`：ARM64 设备（如树莓派 4/5、Apple Silicon Docker 主机、甲骨文 ARM 实例等）
+
+直接执行 `docker pull` 会由 Docker 根据宿主机内核自动拉取对应架构的分层。
+
+### 2. 手动拉取镜像
+```bash
+docker pull ghcr.io/yaping-pro/wx-linux-exporter:latest
+```
+
+### 3. 一键拉取与平滑升级路径
+在 `docker-compose.yml` 所在目录直接执行：
+```bash
+# 1. 拉取 GHCR 远端最新镜像
+docker compose pull
+
+# 2. 重启服务（若镜像有更新会自动重建容器，数据卷及挂载不受影响）
+docker compose --profile api up -d
+```
+
+### 4. 版本锁定与固定版本运行
+`docker-compose.yml` 采用环境变量插值 `${WXLE_IMAGE:-ghcr.io/yaping-pro/wx-linux-exporter:latest}`。若生产环境需要固定特定发布版本（如 `1.4.0`）：
+
+```bash
+# 方式 A：临时环境变量指定
+WXLE_IMAGE=ghcr.io/yaping-pro/wx-linux-exporter:1.4.0 docker compose --profile api up -d
+
+# 方式 B：在当前目录 .env 中持久化
+echo "WXLE_IMAGE=ghcr.io/yaping-pro/wx-linux-exporter:1.4.0" >> .env
+docker compose --profile api up -d
+```
+
+### 5. 本地构建回退 (Local Build)
+若你需要定制源代码或自行构建镜像，有两种方式：
+1. **解注释构建块**：编辑 `docker-compose.yml`，解开 `api`/`worker` 下的 `build:` 块注释，然后执行 `docker compose --profile api up -d --build`；
+2. **指定本地镜像名**：先执行 `docker build -t wx-linux-exporter:local .`，然后通过 `WXLE_IMAGE=wx-linux-exporter:local docker compose --profile api up -d` 启动。
+
+
 ## 服务编排 Profile
 
 `docker-compose.yml` 提供了两种 Profile，可按需启动：
@@ -65,6 +114,44 @@ curl -s -H "Authorization: Bearer ${WECHAT_TOKEN}" \
 docker compose --profile api --profile worker up -d
 ```
 
+---
+
+## 目录权限与细粒度挂载规范
+
+针对只读根文件系统（`read_only: true`）与非 Root 运行约束，Docker Compose 严格拆分为 6 个子目录挂载点：
+
+| 容器内路径 | 宿主机对应路径 | 访问权限 (API) | 访问权限 (Worker) | 用途说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| `/vault/decrypted` | `$VAULT/decrypted` | **只读 (`:ro`)** | **只读 (`:ro`)** | 微信解密 SQLite 数据库快照与 WAL |
+| `/vault/config` | `$VAULT/config` | **只读 (`:ro`)** | **只读 (`:ro`)** | `media_policy.json` 媒体富化与群白名单策略 |
+| `/vault/state` | `$VAULT/state` | **只读 (`:ro`)** | **读写 (`:rw`)** | 互斥锁 (`media.lock`)、图片密钥缓存与进度账本 (`media_ledger.json`) |
+| `/vault/media` | `$VAULT/media` | **只读 (`:ro`)** | **读写 (`:rw`)** | 供 API 端点读取的原图与视频物化文件 |
+| `/vault/exports` | `$VAULT/exports` | *(未挂载)* | **读写 (`:rw`)** | 按日期归档的媒体快照 (`exports/media/<date>/<asset_id>/`) |
+| `/vault/staging` | `$VAULT/staging` | *(未挂载)* | **读写 (`:rw`)** | 媒体解密过程中的临时附件解密缓存 |
+
+### 1. 宿主机预建目录
+在初次启动容器前，必须在宿主机上创建对应的目录结构，避免 Docker 守护进程以 `root` 权限自动新建空目录：
+```bash
+VAULT_DIR="${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}"
+mkdir -p "${VAULT_DIR}"/{decrypted,config,state,media,exports,staging}
+```
+
+### 2. PUID/PGID 与目录属主对齐
+容器内以非 Root 用户运行（默认为 1000:1000）。请确保宿主机上可写目录的属主与传入的 `PUID`/`PGID` 匹配：
+```bash
+# 修正目录属主（若当前用户不是 1000）
+sudo chown -R $(id -u):$(id -g) "${VAULT_DIR}"/{state,media,exports,staging}
+```
+
+### 3. Worker 退出码排查
+Worker 服务在每轮执行结束后会打印退出码，例如：
+```text
+[2026-10-27T10:00:00Z] Running wxmedia sync...
+[2026-10-27T10:00:01Z] exit=1 — sleeping 300s
+```
+若日志中出现 **`exit=1`**，请优先排查：
+1. `/vault/state` 是否具有读写权限（若无写权限，首行尝试获取 `/vault/state/media.lock` 将抛出 `PermissionError` 并退出）；
+2. `/vault/decrypted/current` 是否存在有效且可读的解密数据库。
 ---
 
 ## PUID / PGID 权限定制
@@ -107,5 +194,5 @@ INSTALL_OCR=1 docker compose --profile api up -d --build
      ```
 
 ### 3. 数据为空或提示路径不存在
-- **原因**：宿主机路径映射未对齐。
-- **解决**：默认挂载 `${WECHAT_VAULT_HOST_DIR:-~/.local/share/wechat-vault}` 到容器内的 `/vault:ro`。确保宿主机目录结构包含 `decrypted/current/`，或显式设置 `WECHAT_VAULT_HOST_DIR` 环境变量指向真实路径。
+- **原因**：宿主机路径映射未对齐或未声明。
+- **解决**：默认挂载 `${WECHAT_VAULT_HOST_DIR:-${HOME}/.local/share/wechat-vault}`。确保宿主机目录结构包含 `decrypted/current/`，或显式设置 `WECHAT_VAULT_HOST_DIR` 环境变量指向真实路径（Worker 服务强制要求显式提供环境变量）。

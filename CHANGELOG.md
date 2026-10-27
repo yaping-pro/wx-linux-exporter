@@ -9,6 +9,34 @@
 
 ---
 
+## [1.5.0] - 2026-10-27
+> 包版本 1.5.0 / 数据契约版本 1.3.1（契约本身未升版，本次为多模态/探针门禁/发布工程能力发布）
+
+### Added
+- **视频首帧投递多模态与 Webhook 透传 (`clients/muse_probe.py`, `clients/assistant_webhook.py`)**：
+  - **视频首帧海报投递 (`--video-mode poster|url|both`)**：
+    - 默认 `poster` 模式提取视频首帧 (`thumb.jpg`) 并以 `image_url` base64 形式投递至多模态大模型；
+    - 视频本体永不内联传输（避免传输膨胀与网关超时）；
+    - `locate_local_poster_file` 支持 `exports/media/<date>/<asset_id>/thumb.jpg` 与 `vault/media/<asset_id>/thumb.jpg` 路径解析；
+    - 无本地 poster 时降级为 url 并在文本中提示消费端自行抽帧。
+  - **Webhook 增强**：
+    - `custom` 与 `dify` 载荷支持输出 `media_poster_url` 与 `media_poster_url_abs`；
+    - `feishu` 消息卡片支持追加视频首帧图片行；
+    - 纯图片消息载荷签名与兼容性保持 100% 不变。
+- **语义探针回归门禁与自检套件 (`probes/probes.json`, `tests/test_muse_score.py`)**：
+  - **12 条基准用例集**：全面覆盖文字图 (`text_table`, `text_notice`, `text_receipt`)、纯照片 (`pure_photo`)、群聊上下文 (`chat_context`)、反幻觉 (`counter_hallucination`) 与视频首帧 (`video_first_frame`) 五类真实场景；
+  - **硬门禁机制**：`muse_probe.py --score` 新增 `--fail-under`（最小 composite 准确率）与 `--require-zero-hallucination`（幻觉零容忍）强校验参数；
+  - **离线自检与输出**：`--score` 支持 `--dry-run` 离线自检，输出标准机器可读行 `SCORE: pass hit=12 partial=0 hallu=0 total=12`；
+  - **CI 持续集成守护**：在 GitHub Actions CI 工作流中新增 `Probe suite self-check` job，保障探针规范与打分引擎不退化。
+- **CI/CD 自动化多架构 Docker 镜像发布与 Compose 编排优化 (`.github/workflows/docker-publish.yml`, `docker-compose.yml`)**：
+  - **GHCR 多架构发布**：通过 GitHub Actions 自动交叉编译 `linux/amd64` 与 `linux/arm64` 镜像并推送到 GitHub Container Registry (`ghcr.io/yaping-pro/wx-linux-exporter`)；
+  - **清单强校验**：构建后通过 `docker buildx imagetools inspect` 确认双架构层就绪；
+  - **Compose 默认镜像**：`docker-compose.yml` 默认拉取 GHCR 预构建镜像，保留 `build:` 注释块供本地二次开发。
+- **文档更新**：
+  - `docs/INTEGRATIONS.md`：详细阐述 5.2 探针集用例规范与 5.3 视频首帧多模态投递机制；
+  - `docs/DOCKER.md`：新增「镜像来源与更新 (GHCR)」章节，详解多架构支持、手动拉取、平滑升级路径、版本锁定及本地构建回退；
+  - `README.md`：在 Docker 部署小节补充 `docker pull ghcr.io/yaping-pro/wx-linux-exporter:latest`。
+
 ## [1.4.0] - 2026-10-27
 > 包版本 1.4.0 / 数据契约版本 1.3.1（契约本身未升版，本次为能力性发布）
 

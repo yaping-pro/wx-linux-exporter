@@ -431,15 +431,14 @@ class TestMuseProbeVisionAndEstimate(unittest.TestCase):
         self.assertIn("会话名称: 技术运营群", res)
 
     def test_vision_payload_only_video(self):
-        """--vision with --only video outputs video_url without base64."""
+        """--vision with --only video outputs video link and poster without video base64."""
         res = mp.run_vision(
             data=self.dataset,
             public_base_url="http://127.0.0.1:8765",
             only="video",
+            video_mode="url",
         )
-        self.assertIn("video_url", res)
-        self.assertIn(f"/media/{self.aid_vid}.mp4", res)
-        self.assertIn(f"/media/{self.aid_vid}.jpg", res)
+        self.assertIn(f"http://127.0.0.1:8765/media/{self.aid_vid}.mp4", res)
         self.assertNotIn("data:image", res)
 
     def test_estimate_bytes_table(self):

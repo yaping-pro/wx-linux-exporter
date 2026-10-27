@@ -513,42 +513,257 @@ def post_probe_request(
         return 0, "", f"{type(e).__name__}: {e}"
 
 
+def evaluate_score_thresholds(
+    hits: int,
+    partials: int,
+    hallucinations: int,
+    total: int,
+    fail_under: float = 0.8,
+    require_zero_hallucination: bool = False,
+) -> Tuple[bool, float, str]:
+    """Evaluate score against pass/fail criteria and return machine-readable line.
+
+    Returns:
+        (passed, composite_rate, score_line)
+    """
+    threshold = fail_under
+    if total > 0:
+        composite_rate = (hits + 0.5 * partials) / total
+    else:
+        composite_rate = 0.0
+
+    passed = True
+    if total == 0 or composite_rate < threshold:
+        passed = False
+    if require_zero_hallucination and hallucinations > 0:
+        passed = False
+    status_tag = "pass" if passed else "fail"
+    score_line = (
+        f"SCORE: {status_tag} hit={hits} partial={partials} "
+        f"hallu={hallucinations} total={total}"
+    )
+    return passed, composite_rate, score_line
+
+
+def evaluate_probe_answer(
+    answer: str,
+    must_contain: Optional[List[str]] = None,
+    must_not_contain: Optional[List[str]] = None,
+    expect_empty: bool = False,
+) -> Tuple[str, bool, str]:
+    """Evaluate a single probe's answer.
+
+    Returns:
+        (outcome, is_hallucination, reason)
+        outcome in ("hit", "partial", "miss", "hallucination")
+    """
+    if expect_empty:
+        is_hallu, reason = check_hallucination(answer, must_not_contain)
+        if is_hallu:
+            return "hallucination", True, reason
+        return "hit", False, "ok"
+
+    if must_not_contain:
+        for forbidden in must_not_contain:
+            if forbidden and forbidden in answer:
+                return (
+                    "hallucination",
+                    True,
+                    f"contains forbidden phrase: '{forbidden}'",
+                )
+
+    if not must_contain:
+        return "hit", False, "ok"
+
+    contained = [mc for mc in must_contain if mc in answer]
+    missing = [mc for mc in must_contain if mc not in answer]
+
+    if not missing:
+        return "hit", False, "all keywords matched"
+    if contained:
+        return (
+            "partial",
+            False,
+            f"partial match ({len(contained)}/{len(must_contain)}): "
+            f"missing {missing}",
+        )
+    return "miss", False, f"missing all keywords: {missing}"
+
+
 def run_score(
-    data: Dict[str, Any],
+    data: Optional[Dict[str, Any]],
     probes_path: str,
-    webhook_url: str,
+    webhook_url: str = "",
     webhook_type: str = "custom",
     timeout: int = 30,
     chats_filter: Optional[List[str]] = None,
+    dry_run: bool = False,
+    fail_under: float = 0.8,
+    require_zero_hallucination: bool = False,
+    min_probes: int = 0,
 ) -> Tuple[bool, str]:
     """Execute --score evaluation against probes.json."""
     if not os.path.isfile(probes_path):
-        return False, f"Probes specification file not found: {probes_path}"
+        _, _, score_line = evaluate_score_thresholds(
+            0, 0, 0, 0, fail_under, require_zero_hallucination
+        )
+        return False, (
+            f"Probes specification file not found: {probes_path}\n{score_line}"
+        )
 
-    with open(probes_path, "r", encoding="utf-8") as f:
-        probes: List[Dict[str, Any]] = json.load(f)
+    try:
+        with open(probes_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception as e:
+        _, _, score_line = evaluate_score_thresholds(
+            0, 0, 0, 0, fail_under, require_zero_hallucination
+        )
+        return False, f"Failed to parse probes file: {e}\n{score_line}"
+
+    if isinstance(raw_data, list):
+        probes: List[Dict[str, Any]] = [
+            item
+            for item in raw_data
+            if not (isinstance(item, dict) and "_meta" in item)
+        ]
+    elif isinstance(raw_data, dict) and "probes" in raw_data:
+        probes = raw_data.get("probes", [])
+    else:
+        probes = []
 
     if not isinstance(probes, list) or not probes:
-        return False, "Probes file is empty or not a valid JSON list."
+        _, _, score_line = evaluate_score_thresholds(
+            0, 0, 0, 0, fail_under, require_zero_hallucination
+        )
+        return False, (
+            "Probes file is empty or not a valid JSON list.\n" f"{score_line}"
+        )
 
-    images = extract_media_messages(
-        data, target_kind="image", chats_filter=chats_filter
+    total_probes = len(probes)
+    if min_probes > 0 and total_probes < min_probes:
+        score_line = f"SCORE: fail hit=0 partial=0 hallu=0 total={total_probes}"
+        return False, (
+            f"Probes count ({total_probes}) below required minimum "
+            f"({min_probes}).\n{score_line}"
+        )
+
+    for idx, p in enumerate(probes, 1):
+        if not isinstance(p, dict):
+            score_line = f"SCORE: fail hit=0 partial=0 hallu=0 total={total_probes}"
+            return False, (
+                f"Probe #{idx} is not a valid JSON object.\n{score_line}"
+            )
+        if not p.get("asset_id"):
+            score_line = f"SCORE: fail hit=0 partial=0 hallu=0 total={total_probes}"
+            return False, (
+                f"Probe #{idx} missing required 'asset_id'.\n{score_line}"
+            )
+        if not p.get("question"):
+            score_line = f"SCORE: fail hit=0 partial=0 hallu=0 total={total_probes}"
+            return False, (
+                f"Probe #{idx} missing required 'question'.\n{score_line}"
+            )
+
+    if dry_run:
+        hits = total_probes
+        partials = 0
+        hallucinations = 0
+        passed, comp_rate, score_line = evaluate_score_thresholds(
+            hits=hits,
+            partials=partials,
+            hallucinations=hallucinations,
+            total=total_probes,
+            fail_under=fail_under,
+            require_zero_hallucination=require_zero_hallucination,
+        )
+        details: List[str] = []
+        for idx, p in enumerate(probes, 1):
+            pid = p.get("id", f"probe_{idx:02d}")
+            ptype = p.get("type", "generic")
+            aid = p.get("asset_id", "")
+            q = p.get("question", "")
+            details.append(
+                f"  - [{idx}/{total_probes}] id={pid} type={ptype} "
+                f"asset={aid[:12]}... question='{q[:30]}...' [SCHEMA OK]"
+            )
+
+        sample_probe = probes[0]
+        sample_aid = sample_probe.get("asset_id", "")
+        sample_msg: Dict[str, Any] = {
+            "kind": sample_probe.get("type", "image"),
+            "media": {
+                "asset_id": sample_aid,
+                "kind": (
+                    "video"
+                    if "video" in sample_probe.get("type", "")
+                    else "image"
+                ),
+                "anchor": {
+                    "chat_name": "SampleChat",
+                    "sender": "SampleSender",
+                    "ts": 1750000000,
+                },
+                "ocr": {
+                    "status": "ready",
+                    "text": " ".join(sample_probe.get("must_contain", [])),
+                },
+            },
+        }
+        sample_prompt = build_evaluation_prompt(
+            sample_msg, sample_probe.get("question", "")
+        )
+        sample_payload = format_webhook_request(
+            webhook_type, sample_prompt, sample_msg
+        )
+        dumped = json.dumps(sample_payload, ensure_ascii=False, indent=2)
+        if len(dumped) > 800:
+            truncated = dumped[:800] + "\n... [TRUNCATED to 800 chars]"
+        else:
+            truncated = dumped
+
+        summary_lines = [
+            "=== Semantic Probe Score Summary (DRY-RUN) ===",
+            f"Probes File:        {probes_path}",
+            f"Total Probes:       {total_probes}",
+            f"Hit Rate:           100.0% ({hits}/{total_probes})",
+            f"Composite Score:    {comp_rate * 100:.1f}%",
+            f"Hallucinations:     {hallucinations}",
+            f"Fail Under:         {fail_under}",
+            f"Require Zero Hallu: {require_zero_hallucination}",
+            f"OVERALL:            {'PASS' if passed else 'FAIL'}",
+            "",
+            "Details (Schema Validation):",
+            *details,
+            "",
+            f"Sample Payload Preview (1/{total_probes}):",
+            truncated,
+            "",
+            score_line,
+        ]
+        return passed, "\n".join(summary_lines)
+
+    media_messages = (
+        extract_media_messages(
+            data or {}, target_kind="image", chats_filter=chats_filter
+        )
+        + extract_media_messages(
+            data or {}, target_kind="video", chats_filter=chats_filter
+        )
     )
     asset_map: Dict[str, Dict[str, Any]] = {}
-    for _, msg in images:
+    for _, msg in media_messages:
         media = msg.get("media")
         if isinstance(media, dict):
             aid = media.get("asset_id")
             if aid:
                 asset_map[aid] = msg
 
-    total_probes = len(probes)
     hits = 0
+    partials = 0
     hallucinations = 0
     grounding_successes = 0
 
-    details: List[str] = []
-    all_passed = True
+    details = []
 
     for idx, probe in enumerate(probes, 1):
         asset_id = probe.get("asset_id", "")
@@ -562,7 +777,6 @@ def run_score(
             details.append(
                 f"[{idx}/{total_probes}] Asset '{asset_id}' not found! FAIL"
             )
-            all_passed = False
             continue
 
         prompt = build_evaluation_prompt(msg, question)
@@ -576,30 +790,24 @@ def run_score(
                 f"[{idx}/{total_probes}] Request failed (status={code}): "
                 f"{err} FAIL"
             )
-            all_passed = False
             continue
 
         answer = parse_webhook_response(webhook_type, resp_body)
+        outcome, is_hallu, hallu_reason = evaluate_probe_answer(
+            answer=answer,
+            must_contain=must_contain,
+            must_not_contain=must_not_contain,
+            expect_empty=expect_empty,
+        )
 
-        probe_ok = True
-        is_hallu = False
-        hallu_reason = ""
-
-        if expect_empty:
-            is_hallu, hallu_reason = check_hallucination(
-                answer, must_not_contain
-            )
-            if is_hallu:
-                hallucinations += 1
-                probe_ok = False
-            else:
-                hits += 1
-        else:
-            missing = [mc for mc in must_contain if mc not in answer]
-            if missing:
-                probe_ok = False
-            else:
-                hits += 1
+        probe_ok = False
+        if outcome == "hit":
+            hits += 1
+            probe_ok = True
+        elif outcome == "partial":
+            partials += 1
+        elif outcome == "hallucination":
+            hallucinations += 1
 
         # Check grounding against chat_name
         media = msg.get("media") or {}
@@ -610,10 +818,11 @@ def run_score(
         elif not expect_empty and probe_ok:
             grounding_successes += 1
 
-        if not probe_ok:
-            all_passed = False
-
-        status_tag = "PASS" if probe_ok else "FAIL"
+        status_tag = (
+            "PASS"
+            if probe_ok
+            else ("PARTIAL" if outcome == "partial" else "FAIL")
+        )
         details.append(
             f"--- Probe #{idx} [{status_tag}] (asset={asset_id[:12]}...) ---"
         )
@@ -638,18 +847,29 @@ def run_score(
         hit_rate = 0.0
         grounding_rate = 0.0
 
+    passed, comp_rate, score_line = evaluate_score_thresholds(
+        hits=hits,
+        partials=partials,
+        hallucinations=hallucinations,
+        total=total_probes,
+        fail_under=fail_under,
+        require_zero_hallucination=require_zero_hallucination,
+    )
+
     summary_lines = [
         "=== Semantic Probe Score Summary ===",
         f"Total Probes:       {total_probes}",
         f"Hit Rate:           {hit_rate:.1f}% ({hits}/{total_probes})",
         f"Hallucinations:     {hallucinations}",
         f"Grounding Accuracy: {grounding_rate:.1f}%",
-        f"OVERALL:            {'PASS' if all_passed else 'FAIL'}",
+        f"OVERALL:            {'PASS' if passed else 'FAIL'}",
         "",
         "Details:",
         *details,
+        "",
+        score_line,
     ]
-    return all_passed, "\n".join(summary_lines)
+    return passed, "\n".join(summary_lines)
 
 
 def locate_local_media_file(
@@ -692,8 +912,66 @@ def locate_local_media_file(
                     return matches[0]
 
     return None
+def locate_local_poster_file(
+    media: Dict[str, Any],
+    image_dir: Optional[str],
+    input_file: Optional[str],
+) -> Optional[Path]:
+    """Search for local poster / thumbnail file on disk."""
+    poster = media.get("poster") or ""
+    aid = media.get("asset_id") or ""
+    thumb_field = media.get("thumb") or ""
+    video_path = media.get("path") or ""
 
+    candidate_dirs: List[Path] = []
+    if image_dir:
+        candidate_dirs.append(Path(image_dir))
+    if input_file:
+        inp = Path(input_file).resolve().parent
+        candidate_dirs.append(inp)
+        candidate_dirs.append(inp / "exports")
+        candidate_dirs.append(inp / "vault" / "exports")
 
+    # 1. Direct path from thumb field (e.g. media/2026-10-27/<aid>/thumb.jpg)
+    direct_paths: List[str] = []
+    if thumb_field:
+        direct_paths.append(thumb_field)
+
+    # 2. Derive potential relative path from poster URL or path
+    if poster and not poster.startswith("http://") and not poster.startswith("https://"):
+        cleaned = poster.lstrip("/")
+        if cleaned.startswith("api/wechat/"):
+            direct_paths.append(cleaned[len("api/wechat/"):])
+        direct_paths.append(cleaned)
+
+    # 3. Derive relative path from video path directory (e.g. video.mp4 -> thumb.jpg)
+    if video_path:
+        v_parent = Path(video_path).parent
+        direct_paths.append(str(v_parent / "thumb.jpg"))
+
+    for d in candidate_dirs:
+        for p_rel in direct_paths:
+            if p_rel:
+                p = d / p_rel
+                if p.is_file():
+                    return p
+
+        # 4. Fallback search by asset_id without assuming fixed directory depth
+        if aid:
+            for variant in ("thumb.jpg", f"{aid}.jpg", "image.jpg", f"{aid}_thumb.jpg"):
+                # Check direct media/<aid>/variant
+                p1 = d / "media" / aid / variant
+                if p1.is_file():
+                    return p1
+                p2 = d / aid / variant
+                if p2.is_file():
+                    return p2
+                # Deep search across any directory level (e.g. media/2026-10-27/<aid>/thumb.jpg)
+                matches = list(d.rglob(f"{aid}/{variant}"))
+                if matches and matches[0].is_file():
+                    return matches[0]
+
+    return None
 def run_vision(
     data: Dict[str, Any],
     vision_model: str = "gpt-4o",
@@ -705,6 +983,7 @@ def run_vision(
     export_url: str = "",
     only: str = "image",
     chats_filter: Optional[List[str]] = None,
+    video_mode: str = "poster",
 ) -> str:
     """Generate OpenAI-compatible multimodal payload for Muse."""
     items = extract_media_messages(
@@ -751,33 +1030,58 @@ def run_vision(
         ]
 
         if only == "video":
-            # Video payloads do not inline base64 due to size
             rel_url = media.get("url") or f"/api/wechat/media/{aid}/video.mp4"
             abs_url = f"{base}{rel_url}" if base else rel_url
-            poster_url = media.get("poster") or ""
-            if poster_url and base and not poster_url.startswith("http"):
-                abs_poster = f"{base}{poster_url}"
+            duration_s = media.get("duration_s")
+            dur_str = f"{duration_s}s" if duration_s is not None else "未知时长"
+
+            poster_file = (
+                locate_local_poster_file(media, image_dir, input_file)
+                if not no_base64
+                else None
+            )
+
+            if video_mode == "url":
+                content_list.append({
+                    "type": "text",
+                    "text": (
+                        f"视频链接：{abs_url}（时长 {dur_str}，需 Bearer 鉴权；"
+                        "大文件不进行 base64 内联）"
+                    ),
+                })
+            elif poster_file and poster_file.is_file():
+                p_bytes = base64.b64encode(poster_file.read_bytes()).decode("ascii")
+                p_fmt = poster_file.suffix.lstrip(".").lower()
+                if p_fmt in ("jpg", ""):
+                    p_fmt = "jpeg"
+                img_data_url = f"data:image/{p_fmt};base64,{p_bytes}"
+
+                content_list.append({
+                    "type": "text",
+                    "text": f"这是视频首帧（时长 {dur_str}），视频本体见 {abs_url}",
+                })
+                content_list.append({
+                    "type": "image_url",
+                    "image_url": {"url": img_data_url},
+                })
+                if video_mode == "both":
+                    content_list.append({
+                        "type": "text",
+                        "text": f"视频链接：{abs_url}（需 Bearer 鉴权）",
+                    })
             else:
-                abs_poster = poster_url
-
-            video_obj: Dict[str, Any] = {"url": abs_url}
-            if abs_poster:
-                video_obj["poster"] = abs_poster
-
-            content_list.append({"type": "video_url", "video_url": video_obj})
-            content_list.append({
-                "type": "text",
-                "text": (
-                    "提示：视频从 media_url_abs 获取，需携带 Bearer Token 鉴权头；"
-                    "大文件不进行 base64 内联。"
-                ),
-            })
+                # Poster not found locally or poster is None
+                content_list.append({
+                    "type": "text",
+                    "text": (
+                        f"视频链接：{abs_url}（时长 {dur_str}，无首帧，需消费端自行拉取视频抽帧）"
+                    ),
+                })
         else:
             local_file = locate_local_media_file(media, image_dir, input_file)
             fmt = (media.get("format") or "jpeg").lower()
             if fmt == "jpg":
                 fmt = "jpeg"
-
             if not no_base64 and local_file and local_file.is_file():
                 b64_bytes = base64.b64encode(
                     local_file.read_bytes()
@@ -997,11 +1301,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Estimate payload byte sizes across filter combinations",
     )
-    mode_group.add_argument(
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help="Preview probe payloads without network delivery (default)",
+        help="Preview probe payloads or run offline probe self-check",
+    )
+    parser.add_argument(
+        "--fail-under",
+        type=float,
+        default=0.8,
+        help="Minimum composite hit rate threshold to pass (default: 0.8)",
+    )
+    parser.add_argument(
+        "--require-zero-hallucination",
+        action="store_true",
+        default=False,
+        help="Fail (exit 1) if any hallucination is detected",
+    )
+    parser.add_argument(
+        "--min-probes",
+        type=int,
+        default=12,
+        help="Minimum probes required in --score suite (default: 12)",
     )
 
     # Score mode parameters
@@ -1044,6 +1367,12 @@ def parse_args() -> argparse.Namespace:
         "--no-base64",
         action="store_true",
         help="Output HTTP media_url_abs instead of data: base64 in vision",
+    )
+    parser.add_argument(
+        "--video-mode",
+        choices=["poster", "url", "both"],
+        default="poster",
+        help="Video delivery mode in vision: poster (default), url, both",
     )
     parser.add_argument(
         "--image-dir",
@@ -1094,14 +1423,17 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if not args.webhook_url:
+        if not args.dry_run and not args.webhook_url:
             print("[ERROR] --score requires --webhook-url", file=sys.stderr)
             return 1
 
-    data, err = load_dataset(args)
-    if err or data is None:
-        print(f"[ERROR] {err}", file=sys.stderr)
-        return 1
+    if is_score and args.dry_run and not args.input_file:
+        data = None
+    else:
+        data, err = load_dataset(args)
+        if err or data is None:
+            print(f"[ERROR] {err}", file=sys.stderr)
+            return 1
 
     chats_filter = (
         [c.strip() for c in args.chats.split(",") if c.strip()]
@@ -1137,6 +1469,10 @@ def main() -> int:
             webhook_type=args.webhook_type,
             timeout=args.timeout,
             chats_filter=chats_filter,
+            dry_run=args.dry_run,
+            fail_under=args.fail_under,
+            require_zero_hallucination=args.require_zero_hallucination,
+            min_probes=args.min_probes if args.dry_run else 0,
         )
         print(report)
         return 0 if passed else 1
@@ -1153,6 +1489,7 @@ def main() -> int:
             export_url=args.endpoint,
             only=args.only,
             chats_filter=chats_filter,
+            video_mode=args.video_mode,
         )
         print(preview)
         return 0
