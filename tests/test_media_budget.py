@@ -227,7 +227,7 @@ class MediaBudgetIsolationTests(unittest.TestCase):
             messages=[(self.chat, 1, now - 100, 3, f'<msg><img md5="{asset_id}"/></msg>')],
         )
 
-        today = time.strftime("%Y-%m-%d")
+        today = wechat_media.datetime.now(wechat_media.SHANGHAI_TZ).strftime("%Y-%m-%d")
         ledger_path = self.vault / "state" / "media_ledger.json"
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
         # Seed: file budget is completely exhausted, image budget untouched.
@@ -297,7 +297,7 @@ class MediaBudgetIsolationTests(unittest.TestCase):
         self.assertEqual(rc, 0)
 
         ledger = wechat_media.load_ledger(self.vault / "state" / "media_ledger.json")
-        today = time.strftime("%Y-%m-%d")
+        today = wechat_media.datetime.now(wechat_media.SHANGHAI_TZ).strftime("%Y-%m-%d")
         today_daily = ledger["daily"][today]
         self.assertEqual(today_daily["by_kind"]["image"], 2)
 
