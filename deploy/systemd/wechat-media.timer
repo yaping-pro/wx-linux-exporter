@@ -1,10 +1,29 @@
 [Unit]
 Description=Periodic WeChat Media Enrichment (no-op until config/media_policy.json enables it)
+Documentation=file://__WXHOME__/.local/share/wechat-vault/docs/MEDIA_ENRICHMENT.md
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=5min
+# --- Cadence: 15min, deterministically offset from wechat-decrypt.timer ---
+# wechat-decrypt fires on *:0/5 (:00/:05/:10/...). Anchoring media on a wall-clock
+# calendar at :02/:17/:32/:47 puts every media run ~2min AFTER a decrypt tick, so the
+# two never open the decrypted SQLite at the same instant.
+# Why OnCalendar and not OnUnitActiveSec: OnUnitActiveSec re-anchors on each media
+# finish, so the phase drifts and eventually walks INTO the decrypt grid. OnCalendar
+# pins the offset permanently. It also makes Persistent= actually work (Persistent=
+# is a no-op for OnUnitActiveSec/OnBootSec, which already track their own last trigger).
+OnCalendar=*:2/15
+# Still get one run 5min after boot, even if that is off the calendar grid.
+OnBootSec=5min
+# Jitter so we do not fire in lockstep with other :02-anchored units (watchdogs etc).
+# Bounded at 120s so the run stays inside the :02--:04 window, i.e. >=60s clear of the
+# :00/:05 decrypt ticks.
+RandomizedDelaySec=120
+# Runs missed while the box was off are made up once at next boot.
 Persistent=true
+# Allow systemd to coalesce the wakeup within 30s (saves power on this home box);
+# the 2min anti-collision margin absorbs it.
+AccuracySec=30s
+Unit=wechat-media.service
 
 [Install]
 WantedBy=timers.target
