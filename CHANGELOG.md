@@ -7,7 +7,17 @@
 
 ## [Unreleased]
 
+---
+
+## [v1.5.1] - 2026-10-28
+> 包版本 1.5.1 / 数据契约版本 1.3.1（契约本身未升版，本次为媒体富化缺陷修复、定时任务与发布工程发布）
+
+### Fixed
+- **媒体日预算按类型独立隔离 (`bin/wechat_media.py`, `tests/test_media_budget.py`)**：修复全局单一 `daily["parsed"]` 计数器导致本地零成本解密的图片（`image`）占满 `daily_file_budget: 30` 后将后续图片与 MinerU 文件调用同时饿死的生产 defect。引入 `daily_budget: {file: 30, image: 2000, video: 50}` 与 `daily["by_kind"]`，各类型按自身配额独立拦截；预算超限时记录 `budget_blocked` 提示（`deny_reason: <kind>_budget_exhausted`），次日重试而非标记终态。新增 4 项隔离与变异回归测试。
+
 ### Added
+- **微信媒体富化 systemd timer 定时调度 (`deploy/systemd/wechat-media.{service,timer}`)**：建立每 15 分钟执行一次的定时任务，采用 `OnCalendar=*:2/15`（与解密任务 `:0/15` 错开 2 分钟）+ `RandomizedDelaySec=120` 抖动防 SQLite 竞争，配合 `Persistent=true`、`Type=oneshot` 及 `MemoryMax=2G`、`CPUQuota=150%`、`Nice=10`、`IOSchedulingClass=idle` 生产资源限制。
+- **真实消费端 Muse 验证与防幻觉警告 (`docs/INTEGRATIONS.md`)**：生产 9/9 命中、0 幻觉、3/3 反幻觉正确否认；记录已见图片记忆幻觉规避法则及 Tailscale 私网隔离约束。
 - **合成快照端到端回归套件与变异测试验证 (`tests/e2e/`, `tests/test_e2e_pipeline.py`, `docs/E2E_TESTING.md`)**：提供 100% 离线、零凭据的合成微信 4.x 快照生成器与 6 维 E2E 回归闭环，并通过 7 项语义变异测试证明防御拦截能力。
 - **快照式原子部署脚本与发布工程固化 (`scripts/deploy-snapshot.sh`, `docs/DEPLOY.md`, `tests/test_deploy_script.py`)**：将「时间戳快照 + 原子软链接切换 + 失败自动回滚」发布机制固化为仓库内可执行脚本，替代已失效且危险的旧 `wechat-ops/deploy/deploy-vault.sh`（曾从缺媒体代码的 staging 覆盖生产，导致 930 行 / 10 天漂移）。支持 `--dry-run`/`--rollback`/`--no-restart`，vault 路径在远端解析，所有 systemd 操作用 `sudo -n`。
 

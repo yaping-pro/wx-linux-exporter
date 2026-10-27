@@ -436,3 +436,15 @@ media=none & ocr=none          | 45.20 KB         | 1.0x
 media=image & ocr=head/full    | 98.40 KB         | 2.18x
 media=all (image + video)      | 142.10 KB        | 3.14x
 ```
+
+---
+
+### 5.5 真实消费端验证 (Real-world Consumer Verification: Muse)
+
+生产真实微信图片在 Muse 消费端完成了端到端验收验证：
+- **测试结果**：生产真实微信图片 **9/9 命中、0 幻觉、3/3 反幻觉正确否认**。
+- **本地 OCR 独立性**：`image.ocr.enabled=false` 完全不影响识别效果（Muse 走自己的多模态视觉大模型通道）。
+
+> ⚠️ **关键警告：记忆幻觉与网络隔离**  
+> 1. **切勿使用已上传过的图片验证 URL 拉取**：Muse 在拿到一个**已在对话中上传过**的图片 URL 时，会用记忆/上下文“回答出”看似正确的内容（实测：它描述了一张图并说“和你前面发的是同一张”，但 activity panel 显示 `Searched memory for ...`，并非真实拉取）。**验证 URL 拉取能力时必须用 Muse 从未见过的图**。  
+> 2. **私网隔离限制**：`100.67.218.81` 是 Tailscale 私网地址，Muse 云端与它的浏览器都不可达，实测在 network 层就失败（`TypeError: Failed to fetch`），根本走不到 401——所以 **URL 模式需要公网可达 + Bearer 支持，当前只能走文件上传**。
