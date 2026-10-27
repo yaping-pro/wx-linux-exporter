@@ -141,6 +141,8 @@ def format_payload(
     media_url_abs: Optional[str] = None
     media_url_auth: Optional[str] = None
     media_asset_id: Optional[str] = None
+    media_poster_url: Optional[str] = None
+    media_poster_url_abs: Optional[str] = None
     chat_name: Optional[str] = None
     ocr_text: Optional[str] = None
 
@@ -160,13 +162,22 @@ def format_payload(
         )
         ocr_text = ocr.get("text")
 
+        base = (
+            public_base_url.rstrip("/")
+            or derive_base_url(export_url).rstrip("/")
+        )
         if media_url:
-            base = (
-                public_base_url.rstrip("/")
-                or derive_base_url(export_url).rstrip("/")
-            )
             media_url_abs = f"{base}{media_url}" if base else media_url
             media_url_auth = "bearer"
+
+        mkind = media.get("kind")
+        poster = media.get("poster")
+        if mkind == "video" and poster:
+            media_poster_url = poster
+            if poster.startswith("http://") or poster.startswith("https://"):
+                media_poster_url_abs = poster
+            else:
+                media_poster_url_abs = f"{base}{poster}" if base else poster
 
     if webhook_type == "feishu":
         # Format as Feishu interactive / text webhook payload
@@ -174,6 +185,8 @@ def format_payload(
         text_content = f"{header}\n{content}"
         if has_media and media_url_abs:
             text_content = f"{text_content}\n🖼 原图: {media_url_abs}"
+        if has_media and media_poster_url_abs:
+            text_content = f"{text_content}\n🎬 首帧: {media_poster_url_abs}"
         return {
             "msg_type": "text",
             "content": {
@@ -202,6 +215,10 @@ def format_payload(
                 inputs["media_url_abs"] = media_url_abs
             if media_url_auth is not None:
                 inputs["media_url_auth"] = media_url_auth
+            if media_poster_url is not None:
+                inputs["media_poster_url"] = media_poster_url
+            if media_poster_url_abs is not None:
+                inputs["media_poster_url_abs"] = media_poster_url_abs
             if media_asset_id is not None:
                 inputs["media_asset_id"] = media_asset_id
             if chat_name is not None:
@@ -237,6 +254,10 @@ def format_payload(
             payload["media_url_abs"] = media_url_abs
         if media_url_auth is not None:
             payload["media_url_auth"] = media_url_auth
+        if media_poster_url is not None:
+            payload["media_poster_url"] = media_poster_url
+        if media_poster_url_abs is not None:
+            payload["media_poster_url_abs"] = media_poster_url_abs
         if media_asset_id is not None:
             payload["media_asset_id"] = media_asset_id
         if chat_name is not None:
@@ -245,7 +266,6 @@ def format_payload(
         if ocr_text is not None:
             payload["ocr_text"] = ocr_text
     return payload
-
 
 def post_webhook(
     webhook_url: str,
