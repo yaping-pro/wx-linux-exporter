@@ -38,14 +38,39 @@ def _make_stubs(stub_dir: Path) -> Path:
 
     # ssh -> the script invokes: ssh -o ... -o ... <host> <cmd>
     # so the command is the LAST positional arg; run it locally via bash -c.
-    _write_stub(stub_dir / "ssh", 'exec bash -c "${@: -1}"\n')
+    # Special-case the remote vault-resolution probe so we emulate a Linux host
+    # (path under /home, never /Users), proving $HOME is resolved on the remote.
+    # Any resolved /home path is remapped to $FAKE_VAULT so the local stubs can
+    # actually create dirs / copy files without touching macOS /home.
+    _write_stub(
+        stub_dir / "ssh",
+        'HOMEP="/home/steven/.local/share/wechat-vault"\n'
+        'cmd="${@: -1}"\n'
+        'if [[ "$cmd" == *"printf %s"* && "$cmd" == *VAULT_ROOT* ]]; then\n'
+        '  echo "${FAKE_VAULT:-$HOMEP}"; exit 0\n'
+        "fi\n"
+        'cmd="${cmd//$HOMEP/${FAKE_VAULT:-$HOMEP}}"\n'
+        'exec bash -c "$cmd"\n',
+    )
+    # sudo -> pass-through + log (test asserts the -n flag reaches systemctl)
+    # Drops the leading `sudo` and optional `-n` so the underlying command runs.
+    _write_stub(
+        stub_dir / "sudo",
+        'LOG="${STUB_LOG:?}"\n'
+        'echo "sudo:$*" >> "$LOG"\n'
+        'a=("$@")\n'
+        '[[ "${a[0]}" == "sudo" ]] && a=("${a[@]:1}")\n'
+        '[[ "${a[0]}" == "-n" ]] && a=("${a[@]:1}")\n'
+        'exec "${a[@]}"\n',
+    )
 
-    # rsync -> strip the "host:" prefix and copy locally; log "rsync"
     _write_stub(
         stub_dir / "rsync",
+        'HOMEP="/home/steven/.local/share/wechat-vault"\n'
         'LOG="${STUB_LOG:?}"\n'
         'dest="${@: -1}"\n'
         'src="${@: -2:1}"\n'
+        'dest="${dest//$HOMEP/${FAKE_VAULT:-$HOMEP}}"\n'
         'dest="${dest#*:}"\n'
         'echo rsync >> "$LOG"\n'
         'rm -rf "$dest"\n'
@@ -65,8 +90,8 @@ def _make_stubs(stub_dir: Path) -> Path:
         "esac\n",
     )
 
-    # curl -> always succeed (health ok); log "curl"
-    _write_stub(stub_dir / "curl", 'LOG="${STUB_LOG:?}"; echo curl >> "$LOG"; exit 0\n')
+    # curl -> emit "200" (health ok) and log "curl"
+    _write_stub(stub_dir / "curl", 'LOG="${STUB_LOG:?}"; echo "200"; echo curl >> "$LOG"; exit 0\n')
     # mv -T is GNU-only (macOS BSD mv lacks it); emulate `-T src dst` as
     # "remove dst then move src -> dst", matching GNU's atomic-overwrite.
     _write_stub(
@@ -81,7 +106,7 @@ def _make_stubs(stub_dir: Path) -> Path:
         stub_dir / "readlink",
         'if [ "$1" = "-f" ]; then p="$2"; while [ -L "$p" ]; do d="$(dirname "$p")"; '
         't="$(readlink "$p")"; case "$t" in /*) p="$t";; *) p="$d/$t";; esac; done; '
-        'cd "$(dirname "$p")" 2>/dev/null && echo "$(pwd)/$(basename "$p")"; exit 0; fi\n'
+        'cd "$(dirname "$p")" 2>/dev/null && echo "$(pwd)/$(basename "$p")" || echo "$p"; exit 0; fi\n'
         'exec /usr/bin/readlink "$@"\n',
     )
 
@@ -115,8 +140,17 @@ class DeploySnapshotTest(unittest.TestCase):
 
     def _run(self, extra_args, fail_active=False, capture=True):
         env = dict(os.environ)
+        # never inherit test-only / operator control vars from the host or a
+        # polluted test session env (FAIL_ACTIVE, VAULT_ROOT, FAKE_VAULT).
+        for _v in ("FAIL_ACTIVE", "FAKE_VAULT"):
+            env.pop(_v, None)
+        # VAULT_ROOT is a real operator override; for unit tests we force the
+        # "unset -> resolve on remote" path unless the test passed --vault.
+        env.pop("VAULT_ROOT", None)
         env["PATH"] = f"{self.stub_dir}:{env.get('PATH', '')}"
         env["STUB_LOG"] = str(self.stub_log)
+        # stubs remap the resolved /home/... vault path onto this writable dir
+        env["FAKE_VAULT"] = str(self.fake)
         if fail_active:
             env["FAIL_ACTIVE"] = "1"
         argv = ["bash", str(SCRIPT)] + extra_args
@@ -255,6 +289,58 @@ class DeploySnapshotTest(unittest.TestCase):
         self.assertIn("curl", self._log_lines())
         # bin still points at the OLD snapshot
         self.assertEqual(os.path.realpath(self.fake / "bin"), old_abs)
+
+    # 7) VAULT unset -> resolved on remote, never leaks local /Users/ ----------
+    def test_remote_vault_resolution_no_local_home(self):
+        # No --vault: the script must ask the remote for the path. The ssh stub
+        # resolves it on the "remote" (a Linux-style /home path), and the local
+        # stubs remap that onto the writable fake dir. Critically, the script
+        # must NOT substitute the operator's local macOS $HOME (/Users/...).
+        r = self._run(["--remote", "linux", "--source", str(BIN_DIR)])
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        # the script must NOT substitute the operator's local macOS $HOME
+        # (/Users/...) for the vault path. The rsync *source* (/Users/.../bin) is
+        # legitimately printed in the plan line; only the VAULT path matters.
+        # The deploy.log baseline records the resolved bin path under the vault:
+        # assert it lands in the remapped fake vault (no /Users/ leak there).
+        deploy_log = (self.fake / ".deploy" / "deploy.log").read_text()
+        self.assertIn("bin=", deploy_log)
+        self.assertNotIn("/Users/", deploy_log)
+        # the healthy baseline [OK] line must report a non-empty vault bin path
+        self.assertIn("baseline: bin=", r.stdout)
+        self.assertNotIn("baseline: bin=/Users/", r.stdout)
+
+    # 8) ssh/rsh failure -> [FAIL] + non-zero, never a misleading [OK] ------
+    def test_remote_failure_aborts_not_ok(self):
+        # Make the ssh stub fail for every command (exit 1, no output).
+        (self.stub_dir / "ssh").write_text(
+            "#!/usr/bin/env bash\nLOG=\"${STUB_LOG:?}\"; "
+            'echo "ssh:fail" >> "$LOG"; exit 1\n'
+        )
+        (self.stub_dir / "ssh").chmod(0o755)
+        r = self._run(
+            ["--remote", "linux", "--vault", str(self.fake), "--source", str(BIN_DIR)]
+        )
+        self.assertNotEqual(r.returncode, 0, "must abort when remote is unreachable")
+        self.assertIn("[FAIL]", r.stdout, "must log a failure on remote error")
+        self.assertNotIn("baseline: active=", r.stdout,
+                         "must NOT print a misleading [OK] baseline when remote failed")
+
+    # 9) systemctl invocations carry `sudo -n` -------------------------------
+    def test_systemctl_uses_sudo_n(self):
+        r = self._run(
+            ["--remote", "linux", "--vault", str(self.fake), "--source", str(BIN_DIR)]
+        )
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        # the `sudo` stub records every invocation; both restart and is-active
+        # must have been run through `sudo -n systemctl ...`
+        sudo_lines = [l for l in self._log_lines() if l.startswith("sudo:")]
+        self.assertTrue(any("-n systemctl restart" in l for l in sudo_lines),
+                         msg=f"sudo -n restart missing: {sudo_lines}")
+        self.assertTrue(any("-n systemctl is-active" in l for l in sudo_lines),
+                         msg=f"sudo -n is-active missing: {sudo_lines}")
+        # and the human-readable plan/step line also names sudo -n
+        self.assertIn("sudo -n systemctl restart", r.stdout)
 
 
 if __name__ == "__main__":

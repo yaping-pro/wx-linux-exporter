@@ -17,7 +17,7 @@ set -euo pipefail
 # 默认值（可被命令行参数覆盖）
 # --------------------------------------------------------------------------- #
 REMOTE="linux"
-VAULT="${VAULT_ROOT:-$HOME/.local/share/wechat-vault}"
+VAULT="${VAULT_ROOT:-}"          # 空 = 交给远端解析（见下方 resolve_remote_vault）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOURCE="$REPO_ROOT/bin"
@@ -101,6 +101,32 @@ while [[ $# -gt 0 ]]; do
     *) log_fail "未知参数: $1"; usage; exit 2 ;;
   esac
 done
+# --------------------------------------------------------------------------- #
+# 远端命令：失败即中止（静默失败是本次生产事故的同类问题）
+#   rsh_or_die 用于读取类命令——远端连不上/命令报错必须直接失败，
+#   绝不能用 `|| echo ""` 把错误伪装成"值为空"后继续往下走。
+#   is-active 这类"非 0 也是正常语义"的探针用 rsh_probe 单独处理。
+# --------------------------------------------------------------------------- #
+rsh_or_die() {
+  local out
+  out="$(rsh "$1" 2>&1)"; local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    log_fail "远端命令失败 (rc=$rc): $1"
+    [[ -n "$out" ]] && log_fail "$out"
+    exit 1
+  fi
+  printf '%s' "$out"
+}
+
+# 解析远端 vault 根目录（$HOME 必须在远端展开，绝不能在本机 macOS 先展开）
+resolve_remote_vault() {
+  if [[ -z "$VAULT" ]]; then
+    # shellcheck disable=SC2016  # 故意单引号：让 $HOME/VAULT_ROOT 在远端展开
+    VAULT="$(rsh_or_die 'printf %s "${VAULT_ROOT:-$HOME/.local/share/wechat-vault}"')"
+    [[ -n "$VAULT" ]] || { log_fail "无法解析远端 vault 路径"; exit 1; }
+    log_ok "vault=$VAULT (resolved on $REMOTE)"
+  fi
+}
 
 # --------------------------------------------------------------------------- #
 # 回滚：把 bin 软链接切回 $1 指定的快照目录，重启并做健康断言
@@ -111,7 +137,7 @@ do_rollback() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log_roll "(dry-run) would: ln -sfn '$target' .bin.rb && mv -T .bin.rb bin"
     if [[ "$NO_RESTART" -ne 1 ]]; then
-      log_roll "(dry-run) would: systemctl restart '$SERVICE'"
+      log_roll "(dry-run) would: sudo -n systemctl restart '$SERVICE'"
       log_roll "(dry-run) would: curl -sf '$HEALTH_URL' (retry 5x)"
     fi
     log_ok "(dry-run) rollback plan printed; no changes made"
@@ -125,10 +151,10 @@ do_rollback() {
     log_ok "symlink restored -> $target"
   fi
   if [[ "$NO_RESTART" -ne 1 ]]; then
-    rsh "systemctl restart '$SERVICE'"
+    rsh "sudo -n systemctl restart '$SERVICE'"
     sleep 2
     local active
-    active="$(rsh "systemctl is-active '$SERVICE'" || true)"
+    active="$(rsh "sudo -n systemctl is-active '$SERVICE'" 2>/dev/null || true)"
     if [[ "$active" != "active" ]]; then
       log_fail "回滚后服务仍非 active (got: $active)"
       return 1
@@ -167,11 +193,12 @@ trap 'on_err' ERR
 # 纯回滚分支
 # --------------------------------------------------------------------------- #
 if [[ -n "$ROLLBACK_TS" ]]; then
+  resolve_remote_vault
   log_step "rollback requested -> .deploy/$ROLLBACK_TS"
   TARGET="$VAULT/.deploy/$ROLLBACK_TS"
   # 回滚前先记录基线（只读）
-  BIN_BEFORE="$(rsh "readlink -f '$VAULT/bin'" 2>/dev/null || echo "")"
-  rsh "systemctl is-active '$SERVICE'" >/dev/null 2>&1 || true
+  BIN_BEFORE="$(rsh_or_die "readlink -f '$VAULT/bin'")"
+  rsh "systemctl is-active '$SERVICE' 2>/dev/null" >/dev/null 2>&1 || true
   if do_rollback "$TARGET"; then
     log_ok "rollback to $ROLLBACK_TS succeeded"
     exit 0
@@ -181,25 +208,37 @@ if [[ -n "$ROLLBACK_TS" ]]; then
   fi
 fi
 
-# --------------------------------------------------------------------------- #
 # 正常部署流程
 # --------------------------------------------------------------------------- #
 # 本地 commit（仅用于 CHANGELOG 记录，失败则记 unknown）
 COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
+# 0) 解析远端 vault 路径（必须在首次使用 $VAULT 之前）
+resolve_remote_vault
+
 # 1) 基线记录（只读）
 log_step "recording baseline"
-BIN_BEFORE="$(rsh "readlink -f '$VAULT/bin'" 2>/dev/null || echo "")"
-ACTIVE_BEFORE="$(rsh "systemctl is-active '$SERVICE'" 2>/dev/null || echo unknown)"
-HTTP_BEFORE="$(rsh "curl -o /dev/null -w '%{http_code}' '$HEALTH_URL'" 2>/dev/null || echo unknown)"
+BIN_BEFORE="$(rsh_or_die "readlink -f '$VAULT/bin'")"
+# is-active：rc=0 是 active，rc=3 是 inactive（都是"命令跑成功了"）；
+# 其它 rc（ssh 断线、命令不存在）视为失败，必须中止。
+ACTIVE_RC=0
+ACTIVE_BEFORE="$(rsh "systemctl is-active '$SERVICE' 2>/dev/null")" || ACTIVE_RC=$?
+if [[ $ACTIVE_RC -ne 0 && $ACTIVE_RC -ne 3 ]]; then
+  log_fail "远端 systemctl is-active 执行失败 (rc=$ACTIVE_RC)"
+  exit 1
+fi
+ACTIVE_BEFORE="${ACTIVE_BEFORE:-unknown}"
+HTTP_BEFORE="$(rsh_or_die "curl -s -o /dev/null -w '%{http_code}' '$HEALTH_URL'")"
 OLD_BASELINE_TS="$(basename "$BIN_BEFORE" 2>/dev/null || echo none)"
 if [[ "$DRY_RUN" -ne 1 ]]; then
+  # deploy.log 在 .deploy 下；快照目录要等步骤 2 才建，这里先确保父目录存在
+  rsh "mkdir -p '$VAULT/.deploy'" || { log_fail "无法创建远端 .deploy 目录"; exit 1; }
   {
     echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') deploy start commit=$COMMIT from=$OLD_BASELINE_TS remote=$REMOTE service=$SERVICE"
     echo "  baseline: bin=$BIN_BEFORE active=$ACTIVE_BEFORE health=$HTTP_BEFORE"
-  } | rsh "cat >> '$VAULT/.deploy/deploy.log'" 2>/dev/null || true
+  } | rsh_or_die "cat >> '$VAULT/.deploy/deploy.log'"
 fi
-log_ok "baseline: active=$ACTIVE_BEFORE health=$HTTP_BEFORE"
+log_ok "baseline: bin=$BIN_BEFORE active=$ACTIVE_BEFORE health=$HTTP_BEFORE"
 
 # 2) 计算时间戳 + 建快照目录
 TS="$(date -u '+%Y%m%dT%H%M%SZ')"
@@ -252,13 +291,13 @@ fi
 if [[ "$NO_RESTART" -eq 1 ]]; then
   log_step "--no-restart: 跳过重启与健康检查"
 else
-  log_step "systemctl restart $SERVICE"
+  log_step "restart service (sudo -n systemctl restart $SERVICE)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[STEP] (dry-run) would: systemctl restart $SERVICE"
+    echo "[STEP] (dry-run) would: sudo -n systemctl restart $SERVICE"
   else
-    rsh "systemctl restart '$SERVICE'"
+    rsh "sudo -n systemctl restart '$SERVICE'"
     sleep 2
-    ACTIVE_NOW="$(rsh "systemctl is-active '$SERVICE'" || true)"
+    ACTIVE_NOW="$(rsh "sudo -n systemctl is-active '$SERVICE'" 2>/dev/null || true)"
     if [[ "$ACTIVE_NOW" != "active" ]]; then
       log_fail "重启后服务非 active (got: $ACTIVE_NOW)"
       do_rollback "$OLD_TARGET"
