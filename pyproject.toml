@@ -65,11 +65,12 @@ Changelog = "https://github.com/yaping-pro/wx-linux-exporter/blob/main/CHANGELOG
 [project.scripts]
 wxexport = "wechat_export_api:main"
 wxmedia = "wechat_media:main"
-wxbridge = "assistant_webhook:main"
-wxprobe = "muse_probe:main"
+wxbridge = "clients.assistant_webhook:main"
+wxprobe = "clients.muse_probe:main"
 
 [tool.setuptools]
-package-dir = {"" = "bin"}
+package-dir = {"" = "bin", "clients" = "clients"}
+packages = ["clients"]
 py-modules = [
     "wechat_export_api",
     "wechat_media",
@@ -90,8 +91,4 @@ py-modules = [
     "extract_keys",
     "export_chat",
     "decrypt_all_dbs",
-    "assistant_webhook",
-    "muse_probe",
-    "fetch_export",
-    "fetch_phone_wechat",
 ]

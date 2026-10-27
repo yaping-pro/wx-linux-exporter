@@ -33,13 +33,22 @@ if _CLIENTS_DIR.exists() and str(_CLIENTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CLIENTS_DIR))
 
 try:
-    from assistant_webhook import (  # type: ignore
+    from clients.assistant_webhook import (  # type: ignore
         DEFAULT_ENDPOINT,
         DEFAULT_TOKEN,
         derive_base_url,
         fetch_export,
     )
 except ImportError:
+    try:
+        from assistant_webhook import (  # type: ignore
+            DEFAULT_ENDPOINT,
+            DEFAULT_TOKEN,
+            derive_base_url,
+            fetch_export,
+        )
+    except ImportError:
+        pass
     DEFAULT_ENDPOINT = "http://127.0.0.1:8765/api/wechat/export"
     DEFAULT_TOKEN = ""
 
