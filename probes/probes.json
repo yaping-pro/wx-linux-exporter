@@ -1,5 +1,13 @@
 [
   {
+    "_meta": {
+      "suite": "muse_probe_semantic_evaluation",
+      "test_kind": "prompt_construction_and_semantic_regression",
+      "visual_understanding_verified": false,
+      "description": "prompt 构造回归测试，不验证视觉理解。真正验证视觉理解需要 --vision 载荷 + 真实图 + 真实模型，--score 仅保证探针集本身可用、结构合法与消息富化元数据（OCR/Anchor）上下文问答契约正确。"
+    }
+  },
+  {
     "id": "probe_01_text_table",
     "type": "text_table",
     "asset_id": "10000000000000000000000000000001",

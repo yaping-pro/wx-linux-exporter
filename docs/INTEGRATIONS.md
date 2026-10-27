@@ -233,6 +233,9 @@ python3 clients/muse_probe.py --dry-run --input /tmp/wechat_export.json --limit 
 #### 第三步：语义层打分 (`--score`)
 通过探针集 `probes.json`，把带图会话上下文投递到待测 AI 助手 Webhook，验证模型理解的准确度并严格防范幻觉。
 
+> ⚠️ **定位与边界（重要契约）**：  
+> `--score` 属于 **Prompt 构造回归与富化元数据问答契约测试，不验证视觉理解**。`--score` 仅校验探针集自身可用、Schema 结构合法，以及测试下游 Agent 能否基于消息富化文本（如导出侧本地 OCR 文本 `ocr.text` 与会话锚点 `anchor`）按关键词如实回答且不产生幻觉。  
+> **真正验证视觉理解必须使用 `--vision` 输出的多模态载荷 + 真实解密图片/视频海报 + 具备 Vision 视觉能力的端到端大模型**（详见 5.3 节）。
 #### 5.2.1 自建探针集规范与字段定义
 探针集文件为 JSON 数组，位于 `probes/probes.json`。每条用例包含以下字段：
 

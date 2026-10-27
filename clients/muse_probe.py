@@ -613,12 +613,23 @@ def run_score(
 
     try:
         with open(probes_path, "r", encoding="utf-8") as f:
-            probes: List[Dict[str, Any]] = json.load(f)
+            raw_data = json.load(f)
     except Exception as e:
         _, _, score_line = evaluate_score_thresholds(
             0, 0, 0, 0, fail_under, require_zero_hallucination
         )
         return False, f"Failed to parse probes file: {e}\n{score_line}"
+
+    if isinstance(raw_data, list):
+        probes: List[Dict[str, Any]] = [
+            item
+            for item in raw_data
+            if not (isinstance(item, dict) and "_meta" in item)
+        ]
+    elif isinstance(raw_data, dict) and "probes" in raw_data:
+        probes = raw_data.get("probes", [])
+    else:
+        probes = []
 
     if not isinstance(probes, list) or not probes:
         _, _, score_line = evaluate_score_thresholds(

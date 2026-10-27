@@ -221,11 +221,22 @@ class TestProbesSpecification(unittest.TestCase):
         cls.repo_root = Path(__file__).resolve().parents[1]
         cls.probes_file = cls.repo_root / "probes" / "probes.json"
         with open(cls.probes_file, "r", encoding="utf-8") as f:
-            cls.probes = json.load(f)
+            cls.raw_items = json.load(f)
+        cls.meta = next(
+            (p["_meta"] for p in cls.raw_items if isinstance(p, dict) and "_meta" in p),
+            None,
+        )
+        cls.probes = [
+            p for p in cls.raw_items if not (isinstance(p, dict) and "_meta" in p)
+        ]
 
     def test_probes_file_exists_and_count_ge_12(self):
         self.assertTrue(self.probes_file.is_file())
         self.assertGreaterEqual(len(self.probes), 12)
+
+    def test_probes_has_meta_header(self):
+        self.assertIsNotNone(self.meta)
+        self.assertIn("prompt 构造回归测试", self.meta.get("description", ""))
 
     def test_probes_schema_fields(self):
         for idx, probe in enumerate(self.probes, 1):
