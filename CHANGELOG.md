@@ -9,6 +9,7 @@
 
 ### Added
 - **合成快照端到端回归套件与变异测试验证 (`tests/e2e/`, `tests/test_e2e_pipeline.py`, `docs/E2E_TESTING.md`)**：提供 100% 离线、零凭据的合成微信 4.x 快照生成器与 6 维 E2E 回归闭环，并通过 7 项语义变异测试证明防御拦截能力。
+- **快照式原子部署脚本与发布工程固化 (`scripts/deploy-snapshot.sh`, `docs/DEPLOY.md`, `tests/test_deploy_script.py`)**：将「时间戳快照 + 原子软链接切换 + 失败自动回滚」发布机制固化为仓库内可执行脚本，替代已失效且危险的旧 `wechat-ops/deploy/deploy-vault.sh`（曾从缺媒体代码的 staging 覆盖生产，导致 930 行 / 10 天漂移）。支持 `--dry-run`/`--rollback`/`--no-restart`，vault 路径在远端解析，所有 systemd 操作用 `sudo -n`。
 
 ---
 
