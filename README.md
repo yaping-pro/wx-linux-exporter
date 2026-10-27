@@ -1,8 +1,8 @@
 # WeChat Linux Exporter (`wx-linux-exporter`)
 
 > **Linux 原生微信数据库解密导出管道 + 个人 AI 助理 (muse.ai 风格) 归档服务**  
-> Native Linux PC-WeChat decryption, atomic versioned export, and personal assistant bridge pipeline.
-
+> 专为 Linux 原生微信 4.x 设计的非侵入式只读解密、增量 WAL 合并与 HTTP/Webhook 导出管道。  
+> 👉 **快速上手**: [`docs/QUICKSTART.md`](docs/QUICKSTART.md) \| **安全与威胁模型**: [`SECURITY.md`](SECURITY.md) \| **隐私白皮书**: [`docs/PRIVACY.md`](docs/PRIVACY.md) \| **数据契约**: [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/yaping-pro/wx-linux-exporter?color=brightgreen)](https://github.com/yaping-pro/wx-linux-exporter/releases/latest)
 [![CI & Release](https://github.com/yaping-pro/wx-linux-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/yaping-pro/wx-linux-exporter/actions/workflows/ci.yml)
@@ -16,21 +16,19 @@
 ## 中文
 
 ### 目录
-- [⚡ 30 秒极速上手 (Quickstart)](#-30-秒极速上手-quickstart)
+- [⚡ 5 分钟极速上手 (Quickstart)](docs/QUICKSTART.md)
+- [⚡ 30 秒快捷归档体验](#-30-秒极速上手-quickstart)
 - [⚠️ 运行环境真实性验证声明 (Homelab vs VPS)](#️-运行环境真实性验证声明-homelab-vs-vps)
 - [🤖 交给你的 AI Agent (Autonomous Agent Runbook)](#-交给你的-ai-agent-autonomous-agent-runbook)
 - [💡 项目定位与核心特性](#-项目定位与核心特性)
-- [🧩 媒体富化（可选层：附件解析 / 语音转写）](#-媒体富化可选层附件解析--语音转写)
+- [🧩 媒体富化能力矩阵（图片 / 视频 / 语音 / 文件）](#-媒体富化能力矩阵图片--视频--语音--文件)
 - [🛠️ 从源码安装与构建](#️-从源码安装与构建)
 - [⚙️ 服务编排与 Systemd 配置](#️-服务编排与-systemd-配置)
 - [🤖 接入个人 AI 助理 (Muse 早报 / Webhook)](#-接入个人-ai-助理-muse-早报--webhook)
 - [📊 数据契约与导出 Schema](#-数据契约与导出-schema)
 - [❓ 常见问题与排错指南 (FAQ)](#-常见问题与排错指南-faq)
-- [🤝 兄弟项目 (Sibling Projects)](#-兄弟项目-sibling-projects)
-- [💬 交流群 / Community](#-交流群--community)
 - [🔒 安全政策与免责声明](#-安全政策与免责声明)
 - [📄 开源许可证](#-开源许可证)
-
 ---
 
 ### ⚡ 30 秒极速上手 (Quickstart)
@@ -112,18 +110,16 @@ bash scripts/selfcheck.sh
 
 ---
 
-### 🧩 媒体富化（可选层：附件解析 / 语音转写）
+### 🧩 媒体富化能力矩阵（图片 / 视频 / 语音 / 文件）
 
-> **默认关闭**。不改契约结构（无新增字段/端点/键名），开启后按 [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md) v1.1 的三条语义变更执行。
-> 完整说明见 **[`docs/MEDIA_ENRICHMENT.md`](docs/MEDIA_ENRICHMENT.md)**。
+> **默认关闭**。富化后在保持结构兼容的前提下，把纯占位符拓展为可读、可取的媒体元数据。开启前请查阅 [`docs/DATA_CONTRACT.md`](docs/DATA_CONTRACT.md) 与 [`docs/MEDIA_ENRICHMENT.md`](docs/MEDIA_ENRICHMENT.md)。
 
-| 能力 | 来源 | 成本 |
-| :--- | :--- | :--- |
-| 文件附件（pdf/docx/pptx/xlsx） | MinerU **agent 通道（免 token）** | ≤10MB / ≤20 页，免费 |
-| 文件附件（html/doc/xls/ppt、>10MB） | MinerU **precise 通道（可选 token）** | ≤200MB / ≤200 页 |
-| **语音** | **微信客户端自带语音转文字** | **零成本**：纯读本地 `packed_info_data`，无网络/无模型 |
-| 图片 / 视频 | 不支持 | 见文档 §9 |
-
+| 媒体类型 | 支持状态 | 实现机制 | 成本 / 边界说明 |
+| :--- | :--- | :--- | :--- |
+| **图片** | ✅ **完全支持** | 本地解密原图落盘 + 绝对路径 `media_url_abs` + 可选 RapidOCR 文本投影 | 纯本地处理，零网络开销；Muse 侧可直接接多模态大模型 |
+| **视频** | ✅ **落盘 + 元数据** | 扫描本地硬链接提取 MP4、时长与封面 (`poster`) | **不做本地转码/ASR**；**加密视频未在实机验证**（无法解密时标记 `note: "视频（不可解密）"`） |
+| **语音** | ✅ **完全支持** | 纯读本地 `packed_info_data` 提取微信客户端自带转文字 | **零成本**：本地提取微信转写结果，无网络/无模型消耗 |
+| **文件附件** | ✅ **可选支持** | MinerU **agent 免费通道** (≤10MB) / **precise 通道** (≤200MB) | 需用户显式配置并自愿开启云端解析 |
 ```bash
 # 1) 生成策略（默认 enabled=false）
 cp config/media_policy.example.json config/media_policy.json
