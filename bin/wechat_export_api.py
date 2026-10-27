@@ -6,6 +6,7 @@ Conforms to the Muse WeChat Export specification.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -176,6 +177,50 @@ def parse_time_param(val: str | None, default_epoch: float) -> float:
 def canonical_json_bytes(obj: Any) -> bytes:
     """Serialize object to canonical UTF-8 JSON bytes (sorted keys, compact separators)."""
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def encode_cursor(ts: int, chat_id: str, local_id: int) -> str:
+    """Encodes cursor tuple to base64url string without padding."""
+    payload = {"ts": int(ts), "chat_id": str(chat_id), "local_id": int(local_id)}
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def parse_cursor(cursor_str: str) -> tuple[int, str, int]:
+    """Parses base64url encoded cursor string into (ts, chat_id, local_id).
+
+    Raises ValueError if invalid.
+    """
+    if not isinstance(cursor_str, str) or not cursor_str.strip():
+        raise ValueError("Cursor must be a non-empty string")
+    s = cursor_str.strip()
+    rem = len(s) % 4
+    if rem > 0:
+        s += "=" * (4 - rem)
+    try:
+        raw = base64.urlsafe_b64decode(s.encode("ascii"))
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"Malformed base64url cursor: {cursor_str!r}") from e
+
+    if not isinstance(obj, dict):
+        raise ValueError("Cursor payload must be a JSON object")
+    for k in ("ts", "chat_id", "local_id"):
+        if k not in obj:
+            raise ValueError(f"Cursor payload missing required key: {k!r}")
+
+    ts_val = obj["ts"]
+    chat_id_val = obj["chat_id"]
+    lid_val = obj["local_id"]
+
+    if not isinstance(ts_val, int) or isinstance(ts_val, bool):
+        raise ValueError("Cursor 'ts' must be an integer")
+    if not isinstance(chat_id_val, str) or not chat_id_val:
+        raise ValueError("Cursor 'chat_id' must be a non-empty string")
+    if not isinstance(lid_val, int) or isinstance(lid_val, bool):
+        raise ValueError("Cursor 'local_id' must be an integer")
+
+    return int(ts_val), str(chat_id_val), int(lid_val)
 
 
 def decode_content(message_content: Any, compress_content: Any) -> str:
@@ -525,6 +570,8 @@ def export_wechat_data(
     media_filter: str = "all",
     media_chats: set[str] | None = None,
     ocr_mode: str = "head",
+    limit: int = 0,
+    cursor_tuple: tuple[int, str, int] | None = None,
 ) -> dict[str, Any]:
     """Exports decrypted WeChat messages within the specified time range."""
     contacts = get_cached_contacts(vault_dir)
@@ -567,10 +614,9 @@ def export_wechat_data(
             con.close()
 
     # Query message tables from each shard
-    # Group results by chat_id
-    chats_data: dict[str, dict[str, Any]] = {}
-    total_message_count = 0
-    max_message_time = since_epoch
+    # Collect raw candidate messages across all allowed chats
+    all_candidates: list[dict[str, Any]] = []
+    chat_meta: dict[str, dict[str, Any]] = {}
 
     for shard in shards:
         n2id = name2id_by_shard.get(shard, {})
@@ -611,11 +657,10 @@ def export_wechat_data(
                 if not rows:
                     continue
 
-                if chat_id not in chats_data:
-                    chats_data[chat_id] = {
+                if chat_id not in chat_meta:
+                    chat_meta[chat_id] = {
                         "name": chat_display_name,
                         "kind": chat_kind,
-                        "messages": [],
                     }
 
                 for row in rows:
@@ -757,8 +802,6 @@ def export_wechat_data(
                                     if hold_epoch is None or create_time < hold_epoch:
                                         hold_epoch = create_time
                     ts_str = format_rfc3339(create_time)
-                    if create_time > max_message_time:
-                        max_message_time = create_time
 
                     msg_dict = {
                         "ts": ts_str,
@@ -769,28 +812,73 @@ def export_wechat_data(
                     }
                     if media_obj is not None:
                         msg_dict["media"] = media_obj
-                    chats_data[chat_id]["messages"].append(msg_dict)
-                    total_message_count += 1
+                    all_candidates.append({
+                        "ts": int(create_time),
+                        "chat_id": chat_id,
+                        "local_id": int(local_id),
+                        "msg_dict": msg_dict,
+                    })
         finally:
             con.close()
 
-    # Sort messages within each chat by ts
+    # Sort all candidates strictly by (ts, chat_id, local_id) ascending
+    all_candidates.sort(key=lambda x: (x["ts"], x["chat_id"], x["local_id"]))
+
+    # Apply cursor filtering: skip elements <= cursor
+    if cursor_tuple is not None:
+        c_ts, c_chat, c_lid = cursor_tuple
+        all_candidates = [
+            c for c in all_candidates
+            if (c["ts"], c["chat_id"], c["local_id"]) > (c_ts, c_chat, c_lid)
+        ]
+
+    # Apply limit pagination
+    truncated = False
+    next_cursor: str | None = None
+    if limit > 0 and len(all_candidates) > limit:
+        truncated = True
+        served_candidates = all_candidates[:limit]
+        last_served = served_candidates[-1]
+        next_cursor = encode_cursor(last_served["ts"], last_served["chat_id"], last_served["local_id"])
+    else:
+        served_candidates = all_candidates
+        next_cursor = None
+
+    # Group served messages into chats_list
+    chats_data: dict[str, dict[str, Any]] = {}
+    for item in served_candidates:
+        cid = item["chat_id"]
+        if cid not in chats_data:
+            meta = chat_meta.get(cid, {"name": cid, "kind": "single"})
+            chats_data[cid] = {
+                "chat_id": cid,
+                "name": meta["name"],
+                "kind": meta["kind"],
+                "messages": [],
+            }
+        chats_data[cid]["messages"].append(item["msg_dict"])
+
+    # Sort messages within each chat by ts (and keep chat order sorted by chat_id)
     chats_list: list[dict[str, Any]] = []
     for chat_id in sorted(chats_data.keys()):
         chat_item = chats_data[chat_id]
         chat_item["messages"].sort(key=lambda m: m["ts"])
         chats_list.append(chat_item)
 
-    # Calculate manifest sha256
+    # Calculate manifest sha256 and served message count
     canonical_bytes = canonical_json_bytes(chats_list)
     manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+    total_served_count = len(served_candidates)
 
-    watermark_epoch = max_message_time if total_message_count > 0 else to_epoch
-    # 媒体尚未就绪时暂不推进水位：下游会用 watermark 作为下次 since 复拉，
-    # 否则「先以空 text 导出、水位越过、解析好了也永远读不到」。
-    # 注意：这使 watermark 不再严格单调（详见 docs/DATA_CONTRACT.md v1.1）。
-    if hold_epoch is not None:
-        watermark_epoch = min(watermark_epoch, hold_epoch - 1.0)
+    # Calculate watermark:
+    # When truncated (next_cursor is not None), do NOT advance watermark: keep previous watermark (from_ts/since)
+    if next_cursor is not None:
+        watermark_epoch = since_epoch
+    else:
+        max_message_time = max((c["ts"] for c in served_candidates), default=since_epoch)
+        watermark_epoch = max_message_time if total_served_count > 0 else to_epoch
+        if hold_epoch is not None:
+            watermark_epoch = min(watermark_epoch, hold_epoch - 1.0)
     watermark_str = format_rfc3339(watermark_epoch)
 
     now_epoch = time.time()
@@ -816,15 +904,17 @@ def export_wechat_data(
             "to": format_rfc3339(to_epoch),
         },
         "watermark": watermark_str,
+        "next_cursor": next_cursor,
         "chats": chats_list,
         "manifest": {
             "sha256": manifest_sha256,
-            "message_count": total_message_count,
+            "message_count": total_served_count,
         },
         "payload_stats": {
-            "messages": total_message_count,
+            "messages": total_served_count,
             "media_included": media_included_count,
             "ocr_chars": ocr_chars_count if ocr_mode != "none" else 0,
+            "truncated": truncated,
         },
     }
     return response_payload
@@ -849,6 +939,20 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def write_chunk(self, data: bytes) -> None:
+        """Writes a chunk in HTTP chunked transfer coding."""
+        if not data:
+            return
+        self.wfile.write(f"{len(data):X}\r\n".encode("ascii"))
+        self.wfile.write(data)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def end_chunked(self) -> None:
+        """Writes the final empty chunk terminating chunked transfer coding."""
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def check_auth(self) -> bool:
         """Validates Bearer token in Authorization header when auth is enabled.
@@ -933,6 +1037,49 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 })
                 return
 
+            format_param = query.get("format", ["json"])[0]
+            if format_param not in ("json", "ndjson"):
+                self.send_json(400, {
+                    "error": {
+                        "code": "invalid_param",
+                        "message": f"Invalid format parameter: {format_param!r}",
+                        "hint": "format ∈ json|ndjson",
+                    }
+                })
+                return
+
+            limit_val = query.get("limit", [None])[0]
+            limit = 0
+            if limit_val is not None:
+                try:
+                    limit = int(limit_val)
+                    if limit < 0:
+                        raise ValueError()
+                except ValueError:
+                    self.send_json(400, {
+                        "error": {
+                            "code": "invalid_param",
+                            "message": f"Invalid limit parameter: {limit_val!r}",
+                            "hint": "limit must be a non-negative integer (0 = unlimited)",
+                        }
+                    })
+                    return
+
+            cursor_val = query.get("cursor", [None])[0]
+            cursor_tuple: tuple[int, str, int] | None = None
+            if cursor_val is not None:
+                try:
+                    cursor_tuple = parse_cursor(cursor_val)
+                except ValueError as e:
+                    self.send_json(400, {
+                        "error": {
+                            "code": "invalid_cursor",
+                            "message": f"Invalid cursor: {e}",
+                            "hint": "cursor must be base64url-encoded JSON {'ts':int,'chat_id':str,'local_id':int}",
+                        }
+                    })
+                    return
+
             media_chats_val = query.get("media_chats", [None])[0]
             media_chats_set: set[str] | None = None
             if media_chats_val is not None:
@@ -964,8 +1111,51 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     media_filter=media_param,
                     media_chats=media_chats_set,
                     ocr_mode=ocr_param,
+                    limit=limit,
+                    cursor_tuple=cursor_tuple,
                 )
-                self.send_json(200, result)
+                if format_param == "ndjson":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+
+                    # 1. Manifest header row
+                    manifest_row = {
+                        "type": "manifest",
+                        "exported_at": result["exported_at"],
+                        "range": result["range"],
+                        "watermark": result["watermark"],
+                        "manifest": result["manifest"],
+                    }
+                    self.write_chunk(json.dumps(manifest_row, ensure_ascii=False).encode("utf-8") + b"\n")
+
+                    # 2. Chat and message rows
+                    for chat in result.get("chats", []):
+                        chat_row = {
+                            "type": "chat",
+                            "chat_id": chat.get("chat_id") or chat.get("name"),
+                            "name": chat["name"],
+                            "kind": chat["kind"],
+                        }
+                        self.write_chunk(json.dumps(chat_row, ensure_ascii=False).encode("utf-8") + b"\n")
+                        cid = chat.get("chat_id") or chat.get("name")
+                        for msg in chat.get("messages", []):
+                            msg_row = dict(msg)
+                            msg_row["type"] = "message"
+                            msg_row["chat_id"] = cid
+                            self.write_chunk(json.dumps(msg_row, ensure_ascii=False).encode("utf-8") + b"\n")
+
+                    # 3. End row
+                    end_row = {
+                        "type": "end",
+                        "next_cursor": result["next_cursor"],
+                        "payload_stats": result["payload_stats"],
+                    }
+                    self.write_chunk(json.dumps(end_row, ensure_ascii=False).encode("utf-8") + b"\n")
+                    self.end_chunked()
+                else:
+                    self.send_json(200, result)
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
             return

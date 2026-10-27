@@ -1,11 +1,34 @@
 # 微信导出数据契约规范 (Data Egress Contract)
 
-> **版本**：`v1.3.0` (2026-10-27)
+> **版本**：`v1.3.1` (2026-10-27)
 
-> ## ⚠️ v1.3 语义扩充（三个正交过滤开关 + 视频注入 + 体积统计）
+> ## ⚠️ v1.3.1 语义扩充（分页 + 流式输出 + OpenAPI 3.1 契约规范）
+>
+> 自 v1.3.1 起，`/api/wechat/export` 新增游标分页与 ndjson 流式输出能力，默认行为完全不变（纯增量）：
+>
+> | 参数 | 取值 | 默认 | 语义与消费端指引 |
+> | :--- | :--- | :--- | :--- |
+> | `limit` | 非负整数（`0`=不限） | `0` | 本次响应最多返回多少条消息（跨所有会话，按 `(create_time, chat_id, local_id)` 升序推进） |
+> | `cursor` | 不透明字符串（base64url） | 空 | 游标续传，从该位置之后继续；格式为 `base64url({"ts":int,"chat_id":str,"local_id":int})` |
+> | `format` | `json` \| `ndjson` | `json` | 传输格式：`json` 为完整 JSON 响应；`ndjson` 为分块流式输出（`application/x-ndjson`） |
+>
+> **分页与水位推进原则**：
+> - 响应根新增 `"next_cursor": "<str>|null"`（还有剩余则给出，否则 `null`）。`limit=0` 时 `next_cursor` 恒为 `null`。
+> - `payload_stats` 新增 `"truncated": true|false`（当触发 limit 且仍有后续消息时为 `true`）。
+> - **分页不提前推进 `watermark`**：仅当"全部已结算"（`next_cursor` 为 `null`）时 `watermark` 正常推进；有 `next_cursor` 时，响应中的 `watermark` 保持上一轮值（`since`），消费端不可在此阶段以当前消息推进下一次 since。
+>
+> **流式输出格式（`format=ndjson`）**：
+> - 响应头 `Content-Type: application/x-ndjson`，采用分块传输编码（`Transfer-Encoding: chunked`）。
+> - 行序列规范：
+>   1. 首行 `{"type":"manifest","exported_at":...,"range":...,"watermark":...,"manifest":...}`（不含 messages 数组）；
+>   2. 会话元信息行 `{"type":"chat","chat_id":...,"name":...,"kind":...}`；
+>   3. 消息明细行 `{"type":"message","chat_id":...,"ts":...,"sender":...,"kind":...,"text":...,"note":...}`（字段与 JSON 模式下 messages 内对象逐字段一致）；
+>   4. 末行 `{"type":"end","next_cursor":...,"payload_stats":{...}}`。
+> - 边计算边写入，与 `limit`、`cursor`、`media`、`ocr` 完全正交兼容。
+>
+> ## ⚠️ v1.3.0 历史语义（三个正交过滤开关 + 视频注入 + 体积统计）
 >
 > 自 v1.3.0 起，新增三个正交查询开关、视频富化注入与响应根体积统计 `payload_stats`，默认值严格向后兼容 v1.2：
->
 > | 参数 | 取值 | 默认 | 语义与消费端指引 |
 > | :--- | :--- | :--- | :--- |
 > | `media` | `none` \| `image` \| `video` \| `all` | `all` | 只对选中 kind 注入 `media` 对象；未选中的媒体消息**保留 `note`**（「图片」「视频」），消费端可事后用 `/api/wechat/media?q=` 按需取 |
@@ -117,7 +140,9 @@
   | `media` | string | 否 | `all` | 媒体过滤：`none` \| `image` \| `video` \| `all` |
   | `media_chats` | string | 否 | 空 (全选) | 逗号分隔的会话 ID，仅这些会话注入媒体对象 |
   | `ocr` | string | 否 | `head` | OCR 投影开关：`none` \| `head` \| `full` |
-  | `limit` | int | 否 | 500 (手机端可按需配置) | 保护性单次返回上限 |
+  | `limit` | int | 否 | `0` (不限) | 本次响应最多返回消息条数 (>=0)，触发截断时返回 `next_cursor` |
+  | `cursor` | string | 否 | 空 | base64url 编码游标续传，从该条之后推进 |
+  | `format` | string | 否 | `json` | 传输格式：`json` \| `ndjson` (分块流式) |
 #### (3) `GET /api/health/briefing`
 - **功能**：返回家服每日巡检简报快照（`linux1` 09:00 生成、同时推送 Telegram/飞书的那份原文 + 结构化健康指标），供 AI 助手每日拉取监测。
 - **鉴权**：**必须** `Authorization: Bearer <TOKEN>`，无 token 返回 `401`（与 `/api/wechat/export` 完全一致）。该端点不匿名开放。

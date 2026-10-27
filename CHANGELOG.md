@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 ### Added
+- **分页 + 流式输出 + OpenAPI 3.1 契约规范（契约 v1.3.1，纯增量）**：
+  - **游标分页（`/api/wechat/export`）**：
+    - `limit`（非负整数，默认 `0` = 不限）：单次最多返回消息数，消息跨全部允许会话严格按 `(create_time, chat_id, local_id)` 升序推进；
+    - `cursor`（base64url 编码）：从指定位置之后继续；格式不符或非法时返回 `400 {"error":{"code":"invalid_cursor",...}}`；
+    - 响应根新增 `next_cursor`（有后续给出，否则 `null`；`limit=0` 恒为 `null`）；`payload_stats` 补充 `truncated: true|false`；
+    - `watermark` 水位语义保证：有 `next_cursor`（截断）时不提前推进水位（保持 `since`），仅在全部已结算（`next_cursor` 为 `null`）时推进。
+  - **流式分块输出（`format=ndjson`）**：
+    - 支持 `format=ndjson`（默认 `json`），输出 `Content-Type: application/x-ndjson`；
+    - 采用分块传输编码（`Transfer-Encoding: chunked`），边生成边写，行序列严格为 `manifest` 首行、`chat` 行、`message` 行、`end` 末行；逐字段与 JSON 模式保持一致；
+    - 与 `limit`、`cursor`、`media`、`ocr` 完全兼容。
+  - **OpenAPI 3.1 规范**：
+    - 新建 `docs/openapi.yaml`，实写覆盖 `/api/wechat/export`、`/api/wechat/media`、`/api/wechat/media/{asset_id}/{filename}` 与 `/api/health/briefing`；包括 BearerAuth 鉴权、HTTP 206 Range 分片、`media`/`ocr` 枚举与 `next_cursor`/`payload_stats` 字段。
+  - **测试与文档**：
+    - 新增 `tests/test_api_paging.py`，完整覆盖 limit 截断拼接、cursor 解析/400、非法 limit 400、ndjson 行序与协议头、分页水位不提前推进；
+    - 更新 `docs/DATA_CONTRACT.md` 升至 v1.3.1，声明纯增量兼容。
 - **三个正交过滤开关 + 视频注入 + 体积统计（契约 v1.3.0）**：
   - **三个正交查询开关（`/api/wechat/export`）**：
     - `media ∈ none|image|video|all`（默认 `all`）：按需控制媒体对象注入，未选中媒体消息保留 `note`（「图片」「视频」），消费端可按需事后拉取；
