@@ -33,8 +33,8 @@ export WECHAT_VAULT_HOST_DIR=~/.local/share/wechat-vault
 ### 步骤 2：启动 API 导出服务
 
 ```bash
-# 仅启动导出 API 服务（api profile）
-docker compose --profile api up -d --build
+# 仅启动导出 API 服务（api profile，自动从 GHCR 拉取预构建镜像）
+docker compose --profile api up -d
 ```
 
 ### 步骤 3：验证运行状态
@@ -50,6 +50,54 @@ curl -s -H "Authorization: Bearer ${WECHAT_TOKEN}" \
 ```
 
 ---
+
+## 镜像来源与更新 (GHCR)
+
+项目通过 GitHub Container Registry (GHCR) 提供官方自动化构建的多架构镜像：
+
+```
+ghcr.io/yaping-pro/wx-linux-exporter:latest
+```
+
+### 1. 多架构支持
+每批次镜像均由 CI 基于原生/QEMU 环境交叉编译，同时发布并验证两种硬件架构：
+- `linux/amd64`：标准 x86_64 服务器与 PC
+- `linux/arm64`：ARM64 设备（如树莓派 4/5、Apple Silicon Docker 主机、甲骨文 ARM 实例等）
+
+直接执行 `docker pull` 会由 Docker 根据宿主机内核自动拉取对应架构的分层。
+
+### 2. 手动拉取镜像
+```bash
+docker pull ghcr.io/yaping-pro/wx-linux-exporter:latest
+```
+
+### 3. 一键拉取与平滑升级路径
+在 `docker-compose.yml` 所在目录直接执行：
+```bash
+# 1. 拉取 GHCR 远端最新镜像
+docker compose pull
+
+# 2. 重启服务（若镜像有更新会自动重建容器，数据卷及挂载不受影响）
+docker compose --profile api up -d
+```
+
+### 4. 版本锁定与固定版本运行
+`docker-compose.yml` 采用环境变量插值 `${WXLE_IMAGE:-ghcr.io/yaping-pro/wx-linux-exporter:latest}`。若生产环境需要固定特定发布版本（如 `1.4.0`）：
+
+```bash
+# 方式 A：临时环境变量指定
+WXLE_IMAGE=ghcr.io/yaping-pro/wx-linux-exporter:1.4.0 docker compose --profile api up -d
+
+# 方式 B：在当前目录 .env 中持久化
+echo "WXLE_IMAGE=ghcr.io/yaping-pro/wx-linux-exporter:1.4.0" >> .env
+docker compose --profile api up -d
+```
+
+### 5. 本地构建回退 (Local Build)
+若你需要定制源代码或自行构建镜像，有两种方式：
+1. **解注释构建块**：编辑 `docker-compose.yml`，解开 `api`/`worker` 下的 `build:` 块注释，然后执行 `docker compose --profile api up -d --build`；
+2. **指定本地镜像名**：先执行 `docker build -t wx-linux-exporter:local .`，然后通过 `WXLE_IMAGE=wx-linux-exporter:local docker compose --profile api up -d` 启动。
+
 
 ## 服务编排 Profile
 

@@ -180,6 +180,9 @@ sudo systemctl enable --now wechat-xvfb wechat-runner wechat-decrypt.timer wecha
 针对 Homelab / 家庭服务器环境，项目提供了开箱即用的只读容器编排配置（支持 `api` 与 `worker` 两种 Profile）：
 
 ```bash
+# 0. 拉取预构建多架构镜像（亦可在 compose up 时由 Docker 自动拉取）
+docker pull ghcr.io/yaping-pro/wx-linux-exporter:latest
+
 # 1. 设置安全 Token
 export WECHAT_TOKEN=$(openssl rand -hex 32)
 

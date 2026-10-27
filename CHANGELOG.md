@@ -7,6 +7,22 @@
 
 ## [Unreleased]
 
+### Added - GHCR 多架构镜像发布
+- **CI/CD 自动化多架构 Docker 镜像发布 (`.github/workflows/docker-publish.yml`)**：
+  - 支持触发条件：`main` 分支 push、`v*` tag push 以及 `workflow_dispatch` 手动触发（PR 不触发）；
+  - 权限最小化：仅申请 `contents: read` 与 `packages: write`，使用内置 `GITHUB_TOKEN`，零外部 Secret 依赖；
+  - 多架构支持：基于 QEMU 与 Docker Buildx 自动交叉编译 `linux/amd64` 与 `linux/arm64` 双架构镜像；
+  - 自动打标：集成 `docker/metadata-action`，语义化生成 semver、major.minor、branch、sha- 等规范标签；
+  - 缓存与可选 OCR：启用 GitHub Actions 缓存（`type=gha,mode=max`）；默认发布轻量版本（`INSTALL_OCR=0`），并在 OCI Labels 注明；
+  - 多架构清单强校验：构建完成后通过 `docker buildx imagetools inspect` 校验 `amd64` 与 `arm64` 平台层均已就绪。
+- **Compose 编排优化 (`docker-compose.yml`)**：
+  - `api` 与 `worker` 服务默认采用 `${WXLE_IMAGE:-ghcr.io/yaping-pro/wx-linux-exporter:latest}` GHCR 镜像；
+  - 保留 `build:` 代码块作为注释备选，便于本地二次开发或源码构建回退；
+  - 保持现有所有安全约束（只读根文件系统、非 Root 用户、回环 127.0.0.1 端口绑定、`/vault:ro` 挂载与 Token 强校验）。
+- **文档更新**：
+  - `docs/DOCKER.md`：新增「镜像来源与更新 (GHCR)」章节，详解多架构支持、手动拉取、平滑升级路径、版本锁定及本地构建回退；
+  - `README.md`：在 Docker 部署小节补充 `docker pull ghcr.io/yaping-pro/wx-linux-exporter:latest`。
+
 ---
 
 ## [1.4.0] - 2026-10-27
