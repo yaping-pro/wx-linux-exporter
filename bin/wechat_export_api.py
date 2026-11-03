@@ -71,6 +71,19 @@ _MEDIA_CACHE: dict[str, tuple[float, dict]] = {}
 ALLOWED_MEDIA_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "mp4", "mov"}
 ALLOWED_IMAGE_EXTS = ALLOWED_MEDIA_EXTS
 
+def trim_memory_if_possible() -> bool:
+    """Invokes garbage collection and glibc malloc_trim to return free heaps to OS."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        if hasattr(libc, "malloc_trim"):
+            return bool(libc.malloc_trim(0))
+    except Exception:
+        pass
+    return False
+
 def get_media_paths(server_context: dict[str, Any] | None = None) -> tuple[Path, Path, Path]:
     """解析 (media_vault_root, media_policy_path, media_ledger_path)。"""
     ctx = server_context or {}
@@ -1158,6 +1171,8 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     self.send_json(200, result)
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
+            finally:
+                trim_memory_if_possible()
             return
 
         if path == "/api/wechat/media":
@@ -1432,16 +1447,21 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             if not target_path.is_file():
                 self.send_json(404, {"error": "Not Found"})
                 return
+            file_size = target_path.stat().st_size
             sha256 = (assets.get(asset_id) or {}).get("sha256")
             if not sha256:
                 try:
-                    data = target_path.read_bytes()
-                    sha256 = hashlib.sha256(data).hexdigest()
+                    h = hashlib.sha256()
+                    with open(target_path, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+                    sha256 = h.hexdigest()
                 except OSError:
                     self.send_json(500, {"error": "Failed to read media file"})
                     return
-            else:
-                data = None
 
             etag_header = f'"{sha256}"'
             if_none_match = self.headers.get("If-None-Match", "").strip()
@@ -1451,13 +1471,6 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     self.send_response(304)
                     self.send_header("ETag", etag_header)
                     self.end_headers()
-                    return
-
-            if data is None:
-                try:
-                    data = target_path.read_bytes()
-                except OSError:
-                    self.send_json(500, {"error": "Failed to read media file"})
                     return
 
             content_types = {
@@ -1470,7 +1483,20 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 "mov": "video/quicktime",
             }
             ct = content_types.get(ext, "application/octet-stream")
-            file_size = len(data)
+
+            def _stream_file_range(start_byte: int, end_byte: int) -> None:
+                try:
+                    with open(target_path, "rb") as f:
+                        f.seek(start_byte)
+                        to_send = end_byte - start_byte + 1
+                        while to_send > 0:
+                            buf = f.read(min(65536, to_send))
+                            if not buf:
+                                break
+                            self.wfile.write(buf)
+                            to_send -= len(buf)
+                finally:
+                    trim_memory_if_possible()
 
             # Range support
             range_header = self.headers.get("Range", "").strip()
@@ -1487,7 +1513,7 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                         self.send_header("Accept-Ranges", "bytes")
                     self.send_header("ETag", etag_header)
                     self.end_headers()
-                    self.wfile.write(data)
+                    _stream_file_range(0, file_size - 1)
                     return
                 if not start_str:
                     # suffix bytes: bytes=-500
@@ -1509,16 +1535,16 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                     return
 
                 end = min(end, file_size - 1)
-                part = data[start: end + 1]
+                part_len = end - start + 1
                 self.send_response(206)
                 self.send_header("Content-Type", ct)
                 self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(len(part)))
+                self.send_header("Content-Length", str(part_len))
                 if is_video:
                     self.send_header("Accept-Ranges", "bytes")
                 self.send_header("ETag", etag_header)
                 self.end_headers()
-                self.wfile.write(part)
+                _stream_file_range(start, end)
                 return
 
             self.send_response(200)
@@ -1528,7 +1554,7 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 self.send_header("Accept-Ranges", "bytes")
             self.send_header("ETag", etag_header)
             self.end_headers()
-            self.wfile.write(data)
+            _stream_file_range(0, file_size - 1)
             return
 
         self.send_json(404, {"error": "Not Found"})
@@ -1568,7 +1594,10 @@ def create_server(
     def handler_factory(*args: Any, **kwargs: Any) -> WeChatExportHandler:
         return WeChatExportHandler(*args, server_context=server_context, **kwargs)
 
-    return server_class((host, port), handler_factory)
+    server = server_class((host, port), handler_factory)
+    if hasattr(server, "daemon_threads"):
+        server.daemon_threads = True
+    return server
 
 
 def load_config_file(config_path: Path) -> dict[str, Any]:

@@ -25,7 +25,7 @@ SERVICE="wechat-export-api"
 DRY_RUN=0
 NO_RESTART=0
 ROLLBACK_TS=""
-HEALTH_URL="http://127.0.0.1:8765/health"
+HEALTH_URL="${HEALTH_URL:-}"
 
 # 回滚相关状态（在切换软链接后才会被设置）
 SWITCHED=0
@@ -125,6 +125,13 @@ resolve_remote_vault() {
     VAULT="$(rsh_or_die 'printf %s "${VAULT_ROOT:-$HOME/.local/share/wechat-vault}"')"
     [[ -n "$VAULT" ]] || { log_fail "无法解析远端 vault 路径"; exit 1; }
     log_ok "vault=$VAULT (resolved on $REMOTE)"
+  fi
+  if [[ -z "$HEALTH_URL" ]]; then
+    local h p
+    h="$(rsh "python3 -c \"import json; print(json.load(open('$VAULT/config/export_service.json')).get('host','127.0.0.1'))\" 2>/dev/null" || echo "127.0.0.1")"
+    p="$(rsh "python3 -c \"import json; print(json.load(open('$VAULT/config/export_service.json')).get('port',8765))\" 2>/dev/null" || echo "8765")"
+    HEALTH_URL="http://${h:-127.0.0.1}:${p:-8765}/health"
+    log_ok "health_url=$HEALTH_URL"
   fi
 }
 
