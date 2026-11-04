@@ -1,0 +1,122 @@
+#!/bin/bash
+# redmi-tailnet-keepalive — 保活 redmi-wxpad 的 tailnet 路径, 真离线时报警。
+#
+# 两条独立判据 (缺一不可):
+#   path: tailscale disco ping 拿到 pong  -> tailnet 可路由
+#   biz : 8765 /health 有任何 HTTP 响应   -> 业务服务活着 (401 也算活, 见 DATA_CONTRACT)
+#
+# 自愈: 连续 NUDGE_AT 轮失败后, 经家服 socat relay 的 adb 通道直接拉起 SFA 的
+# VPNService。2026-11-04 前此处是 `adb connect`, 对已连接设备是无操作,
+# 看门狗因此空转 92 分钟 (真因见 docs/OPS.md)。
+#
+# 状态: $STATE_DIR/redmi-tailnet-keepalive.fails  (连续失败轮数, 供巡检 agent 读取)
+#       $STATE_DIR/redmi-tailnet-keepalive.alerted (上次报警的轮数)
+# 恒以 0 退出, 供 systemd timer 每分钟调用。
+
+set -uo pipefail
+
+PEER=${PEER:-100.80.174.96}
+STATE_DIR=${KEEPALIVE_STATE_DIR:-/run}
+STATE="$STATE_DIR/redmi-tailnet-keepalive.fails"
+ALERT_STATE="$STATE_DIR/redmi-tailnet-keepalive.alerted"
+TAG=redmi-tailnet-keepalive
+ADB_RELAY=${ADB_RELAY:-100.67.218.81:5555}
+SFA_COMPONENT=${SFA_COMPONENT:-io.nekohasekai.sfa/.bg.VPNService}
+SFA_TUN_PATH=${SFA_TUN_PATH:-/sys/class/net/tun0}
+BIZ_URL=${BIZ_URL:-http://100.80.174.96:8765/health}
+ALERT_AT=${ALERT_AT:-3}
+NUDGE_AT=${NUDGE_AT:-3}
+NUDGE_SETTLE=${NUDGE_SETTLE:-15}   # 先让设备端看门狗动手, 避免与其并发 startForeground 触发 ANR
+REALERT_EVERY=${REALERT_EVERY:-20}
+PUSH_USER=${PUSH_USER:-steven}
+PUSH=${KEEPALIVE_PUSH:-/home/steven/.agents/scripts/push-report.sh}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+fails=$(cat "$STATE" 2>/dev/null || echo 0)
+[[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+
+path_ok=0
+biz_ok=0
+
+timeout 8 tailscale ping -c 1 --timeout 3s "$PEER" >/dev/null 2>&1 && path_ok=1
+
+# 任何 HTTP 响应 (含 401/403) 都算服务活着; 连接失败/超时才计入
+biz_code=$(timeout 6 curl -s -o /dev/null -w '%{http_code}' -m 5 --noproxy '*' "$BIZ_URL" 2>/dev/null)
+[[ -n "$biz_code" && "$biz_code" != "000" ]] && biz_ok=1
+
+push() {
+    if [ -x "$PUSH" ]; then
+        printf '%s\n' "$1" | runuser -u "$PUSH_USER" -- "$PUSH" >/dev/null 2>&1 \
+            || logger -p user.err -t "$TAG" "push failed"
+    fi
+}
+
+if [ "$path_ok" -eq 1 ] && [ "$biz_ok" -eq 1 ]; then
+    if [ "$fails" -gt 0 ]; then
+        logger -t "$TAG" "recovered after ${fails} failed probe(s)"
+        push "✅ redmi-wxpad 恢复｜tailnet 与 8765 均可达（此前连续失败 ${fails} 轮）"
+    fi
+    echo 0 > "$STATE" 2>/dev/null || true
+    rm -f "$ALERT_STATE" 2>/dev/null || true
+    exit 0
+fi
+
+fails=$((fails + 1))
+echo "$fails" > "$STATE" 2>/dev/null || true
+
+detail="path=$([ $path_ok -eq 1 ] && echo ok || echo down) biz=$([ $biz_ok -eq 1 ] && echo ok || echo "down(${biz_code:-timeout})")"
+logger -p user.warning -t "$TAG" "probe failed ${fails}x peer=${PEER} ${detail}"
+
+# 第 NUDGE_AT 轮: 经 adb relay 直启 SFA (仅当设备端隧道确实不在, 且设备看门狗先手失败)
+device_tunnel_up() {
+    st=$(timeout 8 adb -s "$ADB_RELAY" shell su -c "cat $SFA_TUN_PATH/operstate 2>/dev/null" 2>/dev/null | tr -d '\r\n ')
+    [ -n "$st" ] && [ "$st" != "down" ]
+}
+
+nudge_sfa() {
+    if device_tunnel_up; then
+        logger -p user.info -t "$TAG" "device tunnel already up, skip nudge"
+        return 0
+    fi
+    sleep "$NUDGE_SETTLE"
+    if device_tunnel_up; then
+        logger -p user.info -t "$TAG" "device recovered while settling, skip nudge"
+        return 0
+    fi
+    logger -p user.warning -t "$TAG" "nudging SFA via adb relay ${ADB_RELAY}"
+    timeout 10 adb -s "$ADB_RELAY" shell su -c \
+        "am start-foreground-service -n $SFA_COMPONENT" >/dev/null 2>&1 || true
+    i=0
+    while [ "$i" -lt 20 ]; do
+        sleep 1
+        i=$((i + 1))
+        if device_tunnel_up; then
+            logger -p user.info -t "$TAG" "nudge succeeded after ${i}s"
+            return 0
+        fi
+    done
+    logger -p user.err -t "$TAG" "nudge did not bring tun0 up within 20s"
+    return 1
+}
+
+if [ "$fails" -eq "$NUDGE_AT" ]; then
+    nudge_sfa || true
+fi
+
+# 报警: 达阈值首报一次, 之后每 REALERT_EVERY 轮复报
+alerted=$(cat "$ALERT_STATE" 2>/dev/null || echo 0)
+[[ "$alerted" =~ ^[0-9]+$ ]] || alerted=0
+if [ "$fails" -ge "$ALERT_AT" ]; then
+    if [ "$alerted" -eq 0 ] || [ $((fails - alerted)) -ge "$REALERT_EVERY" ]; then
+        push "⚠️ redmi-wxpad 不可用（连续 ${fails} 轮）
+${detail}
+分层：tailnet 路径 / 8765 业务端口，见上述 detail。
+自愈已尝试：adb 直启 SFA VPNService（锁屏未解锁时会静默失败）。
+处置：若手机锁屏，请解锁并保持充电；解锁后手机侧看门狗 30s 内拉起隧道。
+诊断：ssh linux1 'bash -x /usr/local/bin/redmi-tailnet-keepalive'"
+        echo "$fails" > "$ALERT_STATE" 2>/dev/null || true
+    fi
+fi
+
+exit 0

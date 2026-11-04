@@ -40,7 +40,7 @@ jobs:
 
       - name: Check shell scripts syntax
         run: |
-          bash -n bin/*.sh scripts/*.sh
+          bash -n bin/*.sh scripts/*.sh deploy/host/* deploy/device/*
 
       - name: Assistant webhook field-mapping regression test
         run: |
