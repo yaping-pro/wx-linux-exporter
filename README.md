@@ -233,7 +233,7 @@ curl -s http://127.0.0.1:8765/health
 
 ### 💬 交流群 / Community
 
-欢迎加入微信个人助理与数据管道交流群（探讨 Homelab 微信常驻、AI 助理搭建、数据管道等）：
+欢迎加入社区交流（探讨 Homelab 微信常驻、AI 助理搭建、数据管道等）：
 
 > 💡 **唯一入口**：微信群二维码 7 天即过期，已下线不再维护。请使用 Telegram 群组 👉 **[t.me/WeChatExporter](https://t.me/WeChatExporter)**（长期稳定）。
 > 🐞 问题反馈：直接开 [GitHub Issue](https://github.com/yaping-pro/wx-linux-exporter/issues) 即可。
