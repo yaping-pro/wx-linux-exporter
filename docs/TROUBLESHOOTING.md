@@ -55,6 +55,58 @@ from collections import Counter;print(Counter(v.get('deny_reason') for v in d['a
 - **`hardlink.db` 表结构随微信版本变化**：升级微信后如出现大面积 `missing_source`，先核对 `file_hardlink_info_v4` 是否仍存在。
 - **确认 worker 真的在跑**：`systemctl list-timers wechat-media.timer`；策略 `enabled=false` 时它每轮都是 no-op（这是设计行为）。
 
+### 6. 索引静默冻结：导出 API 一直 200，但今天一条新消息都没有
+
+生产实例 2026-11-08 22:45 → 11-09 22:22 完整踩过一次，**两个独立故障叠加**，必须分别排查：
+
+**(a) 微信客户端掉到登录页（数据源死了）**
+
+```bash
+# 源库最后写入时间：停了多久
+find ~/Documents/xwechat_files/*/db_storage -name "*.db" -newermt "-2 hours" | head
+# 客户端窗口尺寸：292x396 就是扫码登录面板；正常主窗口 >900px 宽
+DISPLAY=:99 xwininfo -root -tree | grep Weixin
+# 当天日志量：正常 80–100MB/天，登录页空转只有几百 KB
+ls -la ~/.xwechat/log/mm_$(date +%Y%m%d).xlog
+```
+
+客户端重启（含主机重启）后**不会**自动恢复会话：登录页停在原地等人。登录页（`292x396`）的
+二维码区域在**没有残留设备会话时是一个静止的灰度骨架占位**（像素均值 ≈74、无模块纹理），
+此时点击它不会刷新，必须扫码；扫码需要一块人眼可见的屏（Xvfb `:99` 是不可见的）。
+
+**已有设备会话时不必扫码**——登录页中下部有一颗宽按钮（窗口内相对坐标 `+145,+306`，
+即屏幕 `+145,+306` 处，窗口原点由 `xwininfo` 给出），点击即"进入微信"，客户端会自动恢复：
+
+```bash
+DISPLAY=:99 xwininfo -root -tree | grep Weixin      # 取 +X+Y
+DISPLAY=:99 xdotool mousemove $((X+145)) $((Y+306)) click 1
+DISPLAY=:99 xdotool mousemove 20 780                # 把指针移开，避免污染截图
+DISPLAY=:99 xwininfo -root -tree | grep Weixin      # 成功后窗口变为 ~917x668 主界面
+find ~/Documents/xwechat_files -name "*.db-wal" -newermt "-3 minutes" | head   # WAL 重新写入
+```
+
+2026-11-09 实测：点击后 30 秒内 `message_0.db-wal` 恢复写入、`session.db` 最新 `last_timestamp`
+追到当下，`wechat-decrypt.timer` 下一轮发布即带回当天全部消息。这是家服无人值守的最大单点：
+**主机重启后必须有人点一下登录页**（或扫码），否则数据源永久静默。
+
+**(b) timer 重启后永久静默（发布链路死了）**
+
+```bash
+systemctl list-timers wechat-decrypt.timer --all --no-pager
+systemctl show -a wechat-decrypt.timer | grep -E "TimersCalendar|TimersMonotonic|NextElapse"
+```
+
+若 `NEXT` 为 `-`、`NextElapseUSecMonotonic=infinity`：触发项丢了。根因是
+`OnUnitActiveSec=` / `OnCalendar=` 这类**空赋值会重置整个计时器列表**（连同
+`OnCalendar` 与 `OnBootSec`）——重启后没有激活基准，`next_elapse=0`，永不触发。
+修复：删掉带空赋值的 drop-in（`/etc/systemd/system/wechat-decrypt.timer.d/interval.conf`），
+只保留 `OnCalendar`/`OnBootSec`，`daemon-reload` 后 `restart`，确认 `NEXT` 有值。
+`tests/test_systemd_units.py` 已把这条固化为静态守卫。
+
+> **水位会撒谎**：数据契约规定「无新消息时 watermark 退化为 `range.to`」（`docs/DATA_CONTRACT.md` 增量语义）。
+> 所以数据源死掉时 API 依然返回 200 + 新鲜水位 + 0 条消息。**判断数据是否新鲜，必须看 `manifest.message_count`
+> 与库里最大 `ts`，不能只看 watermark。**
+
 ---
 
 ## English

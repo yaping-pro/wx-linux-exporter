@@ -3,9 +3,25 @@ Description=Periodic WeChat Database Decryption
 After=network.target
 
 [Timer]
+# --- Cadence: 5min, wall-clock anchored ---
+# Why OnCalendar and not OnUnitActiveSec: OnUnitActiveSec re-anchors on every run
+# (each activation pushes the next elapse 5min further out) and, more importantly,
+# it has NO base after a reboot — systemd schedules it as next_elapse=0 / infinity,
+# so the timer silently stops firing forever until something activates the service
+# by hand. Observed in production on 2026-11-08: vault index froze for 23h because
+# the box rebooted into a login screen and this timer never fired again.
+# OnCalendar survives reboots, does not drift, and makes Persistent=true meaningful
+# (Persistent= is a no-op for OnUnitActiveSec/OnBootSec).
+OnCalendar=*:0/5
+# Still get one run 5min after boot, even if that is off the calendar grid.
 OnBootSec=5min
-OnUnitActiveSec=15min
+# Runs missed while the box was off are made up once at next boot.
 Persistent=true
+# systemd may coalesce the wakeup within 30s; the sync itself takes ~2s.
+AccuracySec=30s
+# Never set the timer's own schedule to an empty value: `OnUnitActiveSec=` followed
+# by a value WIPES every timer trigger in the unit (including OnCalendar) — the
+# exact footgun that disabled this timer on the host. See docs/OPS.md §7.
 
 [Install]
 WantedBy=timers.target

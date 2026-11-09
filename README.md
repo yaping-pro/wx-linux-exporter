@@ -150,7 +150,7 @@ sudo systemctl enable --now wechat-media.timer
 本项目提供了一套开箱即用的 systemd 服务单元（位于 `deploy/systemd/`）：
 - `wechat-xvfb.service`：维持 `:99` 虚拟帧缓冲。
 - `wechat-runner.service`：保持原生 Linux 微信常驻。
-- `wechat-decrypt.timer`：每 15 分钟触发一次 `wechat-sync.sh` 执行增量解密与原子发布。
+- `wechat-decrypt.timer`：每 5 分钟触发一次 `wechat-sync.sh` 执行增量解密与原子发布（`OnCalendar=*:0/5`；**不要**改用 `OnUnitActiveSec` 单触发，重启后它会失去基准而永久静默，见 `docs/OPS.md` §7）。
 - `wechat-export-api.service`：以不可变方式只读提供 HTTP 查询快照。
 
 ```bash
@@ -235,14 +235,8 @@ curl -s http://127.0.0.1:8765/health
 
 欢迎加入微信个人助理与数据管道交流群（探讨 Homelab 微信常驻、AI 助理搭建、数据管道等）：
 
-<p align="center">
-  <img src="assets/wechat-group-qr.png" alt="微信交流群" width="220" /><br>
-  <b>微信个人助理交流</b>
-</p>
-
-> ⚠️ **群二维码时效提示**：微信群二维码有效期为 7 天（当前二维码**有效至 2026-10-20**）。若二维码已过期，请查阅仓库最新提交或开 Issue 提醒维护者更新。  
-> 💡 **长期稳定的备用频道**：微信群二维码 7 天即过期，建议优先使用 Telegram 群组作为持久交流渠道 👉 **[t.me/WeChatExporter](https://t.me/WeChatExporter)**。
-<!-- Maintainer note: rotate assets/wechat-group-qr.png when the group QR expires. -->
+> 💡 **唯一入口**：微信群二维码 7 天即过期，已下线不再维护。请使用 Telegram 群组 👉 **[t.me/WeChatExporter](https://t.me/WeChatExporter)**（长期稳定）。
+> 🐞 问题反馈：直接开 [GitHub Issue](https://github.com/yaping-pro/wx-linux-exporter/issues) 即可。
 
 ---
 

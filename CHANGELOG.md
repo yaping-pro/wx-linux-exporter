@@ -6,6 +6,12 @@
 ---
 
 ## [Unreleased]
+### Fixed
+- **`wechat-decrypt.timer` 重启后永久静默 (`deploy/systemd/wechat-decrypt.timer`, `tests/test_systemd_units.py`)**：生产主机曾用 `OnUnitActiveSec=` 空赋值（后接 `=5min`）追加 5 分钟节拍——空赋值是**列表重置**，会清空该 timer 的**全部**触发项（含 `OnCalendar`/`OnBootSec`）。主机 2026-11-08 22:46 重启后 `next_elapse=infinity`，vault 索引静默冻结 23 小时，而导出 API 仍返回 200 + 新鲜 watermark（契约规定无新消息时水位退化为 `range.to`），消费端无从察觉。仓库单元改为 `OnCalendar=*:0/5` + `OnBootSec=5min` + `Persistent=true`，并新增静态守卫测试禁止 timer 中出现空值触发项、要求每个 timer 至少有一个重启无关的触发项。
+
+### Changed
+- **交流入口收敛 (`README.md`, `assets/wechat-group-qr.png`)**：微信群二维码 7 天即过期（当前有效期至 2026-10-20），已从 README 下线并删除图片资源，避免向读者展示无法加入的死码；社区唯一入口固定为 Telegram 群组 `t.me/WeChatExporter`，问题反馈走 GitHub Issue。
+
 ### Added
 - **Muse 消费端生产全量上线与手写排班表视觉验收 (`docs/INTEGRATIONS.md`)**：
   - 消费端 `fetch_wechat.py` 启用 `--media`（带 `media=image&ocr=none`）与自动落盘/生命周期清理；
