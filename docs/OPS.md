@@ -88,3 +88,95 @@ $A shell 'su -c "cp -a /data/adb/service.d/sfa_watchdog.sh /data/local/tmp/$(dat
   否则 IP 漂移会同时打断控制通道与 LAN 回退。
 * **文档漂移**：`DATA_CONTRACT.md` 声明 `/health` 免鉴权，实测部署实例返回 401。
   探针口径以"非 000 即活"为准，两者需保持同步。
+## 7. 微信登录面板自愈（wechat-login-guard）
+
+**不变量：绝不点击真二维码。** 真二维码需要人拿手机扫；点它的区域不但无效，还可能落到
+「切换账号」/「仅传输文件」上。守卫 [`deploy/host/wechat-login-guard`](../deploy/host/wechat-login-guard)
+只在下列四条**同时**成立时点一次：
+
+| # | 门 | 判据 |
+|---|---|---|
+| 1 | 几何 | 窗口 `292x396 ±8`；宽度 >800 视为已登录，直接退出且不抓像素 |
+| 2 | 像素（硬否决） | 二维码卡片是灰色骨架占位：均值 55–100、σ<80、`>200` 占比<0.15、`<70` 占比<0.70、每行水平跳变<8 |
+| 3 | OCR 主判据 | tesseract `chi_sim` 在按钮区域（窗口相对 `30..262 × 282..332`，`--psm 7`）读出「进入微信」；读不出时再用整窗 OCR（`--psm 6`）回退。允许 1 个字符的识别噪声，空白/全角空格先归一化 |
+| 4 | OCR 否决 | 全窗口**没有**「扫码登录」/「切换账号」/「仅传输文件」 |
+
+像素分类器是硬否决：OCR 说「进入微信」也不算数——误 OCR 永远点不进真二维码。
+任一条不满足就不点，并在 journal 打一条 `event=human_required`（每 boot 只报一次）。
+
+点击点：窗口相对 `+145,+306`，绝对坐标由 `xwininfo` 的窗口原点推出（2026-11-16 实测原点
+`+494,+202`，即绝对 `+639,+508`；重启后原点不固定，运行时才算）。点完把指针挪到 `20,780`
+（避免污染后续截图），等 `GUARD_SETTLE_SEC`（默认 20s），再读几何：宽度 >800 才算恢复。
+限流：每 boot 最多 3 次点击，两次之间至少 600s（`/var/lib/wechat-login-guard/state.json`）。
+
+### 7.1 安装（linux1）
+
+```bash
+scp deploy/host/wechat-login-guard linux1:/tmp/
+scp deploy/systemd/wechat-login-guard.service deploy/systemd/wechat-login-guard.timer linux1:/tmp/
+ssh linux1 'sudo install -m 0755 /tmp/wechat-login-guard /usr/local/bin/
+  sudo install -m 0644 /tmp/wechat-login-guard.service /tmp/wechat-login-guard.timer \
+                     /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now wechat-login-guard.timer'
+```
+
+`StateDirectory=wechat-login-guard` 由 systemd 创建并 chown 给 `User=steven`。
+若该目录缺失或不可写，脚本会退回 `/tmp`——在 `PrivateTmp=yes` 下每次调用都是新 /tmp，
+点击预算等于失效；所以**不要**删这个 `StateDirectory=` 行。
+
+### 7.2 只读验证
+
+```bash
+ssh linux1 'sudo -u steven DISPLAY=:99 /usr/local/bin/wechat-login-guard --check'   # 不点，只报告
+ssh linux1 'systemctl list-timers wechat-login-guard.timer --all --no-pager'
+```
+
+`--check` 打印的就是生产同格式的决策行：
+
+```
+wechat-login-guard: level=info event=login_panel_skeleton geometry=292x396+494+202 \
+  stats=(mean=81.1,std=54.2,trans=3.70,hi=0.05,lo=0.45) action=would_click \
+  outcome=dry_run(pending) ocr=ok ocr_text="进入微信"
+```
+
+`geometry=` 是 `宽x高+X+Y`（窗口绝对原点），`stats=(mean,std,trans,hi,lo)` 是二维码卡片
+（窗口相对 `104..190 × 76..157`）的标定向量——客户端改版后据此重新标定阈值。
+
+### 7.3 读 journal
+
+```bash
+ssh linux1 'journalctl -u wechat-login-guard.service -n 20 --no-pager'
+```
+
+| event | 含义 | 处置 |
+|---|---|---|
+| `logged_in` | 宽度 >800，已登录，不碰像素 | 无 |
+| `login_panel_skeleton` → `click_restored` | 已点击，窗口恢复到 >800 | 无（点击预算清零） |
+| `click_ineffective`（退出码 3） | 点了但仍是登录页 | 设备会话大概已失效，等人 |
+| `qr_like` / `ocr_veto` / `ocr_no_label` | 真二维码或 OCR 有歧义，**未点** | 需人工扫码，见 §7.4 |
+| `rate_limited` | 本 boot 已点 3 次或距上次 <600s | 说明前面几次都没成功，等人 |
+| `capture_failed`（退出码 2） | ffmpeg 抓帧失败 | 查 `DISPLAY=:99`、X 权限 |
+| `ocr=unavailable` | 没有 `chi_sim` 语言包，退化为纯像素判定 | 装 `tesseract-ocr-chi-sim` |
+| `locked` | 上一轮仍在运行 | 正常竞争，忽略 |
+
+### 7.4 回滚
+
+```bash
+ssh linux1 'sudo systemctl disable --now wechat-login-guard.timer
+  sudo rm -f /etc/systemd/system/wechat-login-guard.service \
+             /etc/systemd/system/wechat-login-guard.timer
+  sudo systemctl daemon-reload
+  sudo rm -rf /var/lib/wechat-login-guard'
+```
+
+### 7.5 已知限制（不要用"自动恢复"承诺掩盖）
+
+* **真扫码无解**：设备会话真丢了只剩真二维码，而 Xvfb `:99` 不可见。守卫只会把它曝光成
+  `event=human_required`（每 boot 一次），不会替你扫码；处置仍是临时投屏或重新登录设备。
+* **OCR 依赖语言包**：linux1 实测 tesseract 5.5.0 含 `chi_sim`/`eng`/`osd`。缺 `chi_sim` 时
+  守卫自动退化为纯像素判定，并在 journal 标注 `ocr=unavailable`（安全方向变窄，不是变宽）。
+* **像素阈值是标定值**：微信客户端重画登录面板后需用 `--check` 打出的向量重新标定。
+  错标定的代价是"少点"（人被迫介入），不是"乱点"。
+* **`User=` 必须与 Xvfb 属主一致**：`steven` 拥有 `/tmp/.X99-lock`，换 user 后 `xwininfo`
+  会认证失败并把每一轮都记成 `capture_failed`。

@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""wechat-login-guard — click the WeChat login panel's "进入微信" button once.
+
+WHY
+    linux1 runs the WeChat desktop client under Xvfb :99. After a host reboot the
+    client lands on the login panel (window 292x396) and waits for a human, so the
+    export pipeline goes silent (2026-11-13: 4-day outage, 2026-11-16: 16h).
+    When a residual device session exists, the panel's "进入微信" button (window
+    relative +145,+306) resumes the session without any QR scan.
+
+HARD SAFETY INVARIANT
+    Never click when a real scannable QR is on screen: a real QR needs a human with
+    a phone, and clicking its area could land on "Switch Account" / "Transfer files
+    only". Two independent gates must agree before any click:
+
+      1. OCR (primary): tesseract chi_sim must read the "进入微信" button label in
+         the documented button region (window-relative 30..262 x 282..332, --psm 7;
+         whole-window --psm 6 is only a fallback when the region pass is silent), and
+         must NOT read 「扫码登录」/「切换账号」/「仅传输文件」 anywhere in the window.
+      2. Pixel classifier (hard veto): the QR card must be the static gray SKELETON
+         placeholder (mean luma, stddev, bright/dark fractions, horizontal
+         transitions per row), otherwise no click — a mis-OCR can never click into
+         a real QR.
+
+    Any ambiguity is a no-op plus a once-per-boot HUMAN REQUIRED journal line.
+
+Runs one shot per systemd timer activation. python3 stdlib + xwininfo + ffmpeg +
+xdotool + tesseract only (no PIL/numpy: the production host has no Python extras).
+When chi_sim is not installed the guard degrades to the pixel classifier alone and
+says so in the journal (see docs/OPS.md §7).
+
+Env seams (see docs/OPS.md):
+    DISPLAY                 X display to inspect (default :99)
+    GUARD_STATE_DIR         rate-limit state dir (default /var/lib/wechat-login-guard)
+    GUARD_LOCK_PATH         flock path (default /run/wechat-login-guard.lock)
+    GUARD_BOOT_ID_PATH      boot id source (default /proc/sys/kernel/random/boot_id)
+    GUARD_SETTLE_SEC        seconds to wait after clicking (default 20, 0 in tests)
+    GUARD_OCR_LANG          tesseract language pack (default chi_sim+eng)
+
+Exit codes: 0 benign (including success and human-required), 2 measurement
+unknown, 3 click did not restore the session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+
+TAG = "wechat-login-guard"
+
+# --- geometry / UI constants -------------------------------------------------
+LOGIN_PANEL_W = 292
+LOGIN_PANEL_H = 396
+GEOMETRY_TOLERANCE = 8          # 292x396 +/- 8 in either dimension is "login panel"
+MAIN_WINDOW_MIN_W = 800         # wider than this == logged in, do not touch pixels
+CLICK_OFFSET = (145, 306)       # window-relative centre of "进入微信"
+PARK_POINTER = (20, 780)        # keep the pointer out of future screenshots
+QR_CARD_BOX = (104, 76, 190, 157)      # window-relative, half-open: x0,y0,x1,y1
+BUTTON_LABEL_BOX = (30, 282, 262, 332)  # window-relative crop around the button label
+TRANSITION_DELTA = 60           # |adjacent pixel delta| that counts as a transition
+
+# --- classifier thresholds (SKELETON only when ALL hold) ----------------------
+# Calibrated on the 2026-11-16 login panel (window origin +494,+202):
+# card abs (598,278)-(684,359) -> mean 81.1, std 54.2, frac>200 0.048,
+# frac<70 0.446, transitions/row ~3.7.
+SKELETON_MEAN_MIN = 55.0
+SKELETON_MEAN_MAX = 100.0
+SKELETON_STD_MAX = 80.0
+SKELETON_FRAC_HI_MAX = 0.15     # fraction of pixels > 200
+SKELETON_FRAC_LO_MAX = 0.70     # fraction of pixels < 70
+SKELETON_TRANS_MAX = 8.0        # mean horizontal transitions per row
+
+# --- OCR gate ----------------------------------------------------------------
+BUTTON_LABEL = "进入微信"
+VETO_PHRASES = ("扫码登录", "切换账号", "仅传输文件")
+OCR_MAX_SUBSTITUTIONS = 1       # accept one garbled character in a phrase
+OCR_PSM_WHOLE = "6"             # uniform block of text
+OCR_PSM_BUTTON = "7"            # single line
+
+# --- rate limits -------------------------------------------------------------
+MAX_CLICKS_PER_BOOT = 3
+MIN_CLICK_INTERVAL_SEC = 600.0
+
+DEFAULT_DISPLAY = ":99"
+DEFAULT_STATE_DIR = "/var/lib/wechat-login-guard"
+DEFAULT_LOCK_PATH = "/run/wechat-login-guard.lock"
+FALLBACK_DIR = "/tmp/wechat-login-guard"
+DEFAULT_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+DEFAULT_OCR_LANG = "chi_sim+eng"
+
+STATE_FILE_NAME = "state.json"
+COMMAND_TIMEOUT_SEC = 20
+OCR_STATUS_OK = "ok"
+OCR_STATUS_UNAVAILABLE = "unavailable"
+OCR_STATUS_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class WindowGeometry:
+    win_id: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+@dataclass(frozen=True)
+class QrStats:
+    mean: float
+    std: float
+    frac_hi: float
+    frac_lo: float
+    transitions: float
+
+
+@dataclass(frozen=True)
+class OcrResult:
+    text: str
+    label_found: bool
+    veto_hits: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RateGate:
+    allowed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class Decision:
+    event: str
+    action: str
+    outcome: str
+    exit_code: int
+    click: bool = False
+    human: bool = False
+    detail: str = ""
+
+
+# --- xwininfo parsing --------------------------------------------------------
+_LINE_ID_RE = re.compile(r"^\s*(0x[0-9a-fA-F]+)\s")
+_GEO_RE = re.compile(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)")
+_OFFSET_RE = re.compile(r"([+-]\d+)([+-]\d+)")
+
+
+def parse_geometry(tree_text: str) -> WindowGeometry | None:
+    """Pick the largest window whose title/class mentions Weixin.
+
+    Child windows can repeat the title, so the largest area wins. The absolute
+    upper-left comes from the trailing `+X+Y` pair (present in `-root -tree` for
+    every window); when absent the window-relative offset is used, which is the
+    same value for a window parented directly by the root.
+    """
+    candidates: list[WindowGeometry] = []
+    for line in tree_text.splitlines():
+        if "Weixin" not in line:
+            continue
+        id_match = _LINE_ID_RE.match(line)
+        geo_match = _GEO_RE.search(line)
+        if not id_match or not geo_match:
+            continue
+        w, h = int(geo_match.group(1)), int(geo_match.group(2))
+        offsets = _OFFSET_RE.findall(line)
+        if len(offsets) >= 2:
+            x, y = int(offsets[-1][0]), int(offsets[-1][1])
+        else:
+            x, y = int(geo_match.group(3)), int(geo_match.group(4))
+        candidates.append(WindowGeometry(id_match.group(1), x, y, w, h))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda g: g.w * g.h)
+
+
+def within_login_tolerance(geom: WindowGeometry) -> bool:
+    return (
+        abs(geom.w - LOGIN_PANEL_W) <= GEOMETRY_TOLERANCE
+        and abs(geom.h - LOGIN_PANEL_H) <= GEOMETRY_TOLERANCE
+    )
+
+
+# --- frame helpers -----------------------------------------------------------
+def clamp_box(box: tuple[int, int, int, int],
+              frame_w: int, frame_h: int) -> tuple[int, int, int, int] | None:
+    x0, y0, x1, y1 = box
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(frame_w, x1), min(frame_h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1, y1
+
+
+def crop_bytes(frame: bytes, frame_w: int,
+               box: tuple[int, int, int, int]) -> tuple[bytes, int, int] | None:
+    """Slice a window-relative rectangle out of a raw gray frame."""
+    frame_h = len(frame) // frame_w if frame_w else 0
+    clamped = clamp_box(box, frame_w, frame_h)
+    if clamped is None:
+        return None
+    x0, y0, x1, y1 = clamped
+    chunks = [frame[y * frame_w + x0:y * frame_w + x1] for y in range(y0, y1)]
+    return b"".join(chunks), x1 - x0, y1 - y0
+
+
+def compute_stats(frame: bytes, frame_w: int,
+                  box: tuple[int, int, int, int]) -> QrStats | None:
+    cropped = crop_bytes(frame, frame_w, box)
+    if cropped is None:
+        return None
+    region, width, height = cropped
+    total = 0
+    total_sq = 0
+    hi = 0
+    lo = 0
+    transitions = 0
+    for y in range(height):
+        row = region[y * width:(y + 1) * width]
+        total += sum(row)
+        total_sq += sum(value * value for value in row)
+        hi += sum(1 for value in row if value > 200)
+        lo += sum(1 for value in row if value < 70)
+        transitions += sum(1 for a, b in zip(row, row[1:]) if abs(b - a) > TRANSITION_DELTA)
+    count = width * height
+    if count == 0:
+        return None
+    mean = total / count
+    variance = max(0.0, total_sq / count - mean * mean)
+    return QrStats(
+        mean=mean,
+        std=math.sqrt(variance),
+        frac_hi=hi / count,
+        frac_lo=lo / count,
+        transitions=transitions / height,
+    )
+
+
+def classify_qr(stats: QrStats | None) -> tuple[str, list[str]]:
+    """SKELETON only when every check passes; anything else is never clickable."""
+    if stats is None:
+        return "REAL_QR_OR_UNKNOWN", ["no_frame"]
+    failures: list[str] = []
+    if not (SKELETON_MEAN_MIN <= stats.mean <= SKELETON_MEAN_MAX):
+        failures.append(f"mean={stats.mean:.1f} outside [{SKELETON_MEAN_MIN},{SKELETON_MEAN_MAX}]")
+    if stats.std >= SKELETON_STD_MAX:
+        failures.append(f"std={stats.std:.1f} >= {SKELETON_STD_MAX}")
+    if stats.frac_hi >= SKELETON_FRAC_HI_MAX:
+        failures.append(f"frac_hi={stats.frac_hi:.2f} >= {SKELETON_FRAC_HI_MAX}")
+    if stats.frac_lo >= SKELETON_FRAC_LO_MAX:
+        failures.append(f"frac_lo={stats.frac_lo:.2f} >= {SKELETON_FRAC_LO_MAX}")
+    if stats.transitions >= SKELETON_TRANS_MAX:
+        failures.append(f"trans={stats.transitions:.2f} >= {SKELETON_TRANS_MAX}")
+    if failures:
+        return "REAL_QR_OR_UNKNOWN", failures
+    return "SKELETON", []
+
+
+# --- OCR ---------------------------------------------------------------------
+def normalize_ocr(text: str) -> str:
+    """Drop every whitespace run (full-width included) that OCR sprinkles in."""
+    return re.sub(r"[\s\u3000\u00a0]+", "", text)
+
+
+def fuzzy_contains(haystack: str, phrase: str,
+                   max_substitutions: int = OCR_MAX_SUBSTITUTIONS) -> bool:
+    """True when `phrase` occurs allowing up to `max_substitutions` wrong chars."""
+    needle = normalize_ocr(phrase)
+    if not needle:
+        return False
+    span = len(needle)
+    for start in range(0, max(0, len(haystack) - span + 1)):
+        window = haystack[start:start + span]
+        if sum(1 for a, b in zip(window, needle) if a != b) <= max_substitutions:
+            return True
+    return False
+
+
+def interpret_ocr(whole_text: str, button_text: str) -> OcrResult:
+    whole = normalize_ocr(whole_text)
+    button = normalize_ocr(button_text)
+    label_found = fuzzy_contains(button, BUTTON_LABEL) or fuzzy_contains(whole, BUTTON_LABEL)
+    vetoes = tuple(p for p in VETO_PHRASES if fuzzy_contains(whole, p))
+    return OcrResult(
+        text=whole_text.replace("\n", " ").strip(),
+        label_found=label_found,
+        veto_hits=vetoes,
+    )
+
+
+# --- decision ----------------------------------------------------------------
+def decide(geom: WindowGeometry | None, stats: QrStats | None,
+           ocr: OcrResult | None = None, gate: RateGate | None = None,
+           ocr_status: str = OCR_STATUS_OK) -> Decision:
+    """Pure decision: geometry + pixel stats + OCR + rate gate -> what to do.
+
+    Pixel classification is a hard veto and runs first: no OCR result can override
+    it. With chi_sim missing (ocr_status == unavailable) the pixel verdict alone is
+    authoritative, which is the documented degraded mode.
+    """
+    gate = gate or RateGate(True, "ok")
+    if geom is None:
+        return Decision("no_window", "none", "absent", 0)
+    if geom.w > MAIN_WINDOW_MIN_W:
+        return Decision("logged_in", "none", "already_logged_in", 0)
+    if not within_login_tolerance(geom):
+        return Decision(
+            "unknown_geometry", "none", "geometry_out_of_tolerance", 0,
+            detail=f"expected {LOGIN_PANEL_W}x{LOGIN_PANEL_H}+-{GEOMETRY_TOLERANCE}",
+        )
+    if stats is None:
+        return Decision("capture_failed", "none", "unknown", 2,
+                        detail="no frame from x11grab")
+
+    verdict, failures = classify_qr(stats)
+    if verdict != "SKELETON":
+        return Decision("qr_like", "none", "pixel_veto", 0, human=True,
+                        detail=";".join(failures))
+
+    if ocr_status == OCR_STATUS_FAILED:
+        return Decision("ocr_failed", "none", "ocr_error", 0, human=True,
+                        detail="tesseract failed")
+    if ocr_status == OCR_STATUS_OK:
+        if ocr is None:
+            return Decision("ocr_no_label", "none", "no_ocr_result", 0, human=True)
+        if ocr.veto_hits:
+            return Decision("ocr_veto", "none",
+                            "veto:" + ",".join(ocr.veto_hits), 0, human=True)
+        if not ocr.label_found:
+            return Decision("ocr_no_label", "none", "label_not_found", 0, human=True)
+    # ocr_status == unavailable: pixel classifier is the only gate (degraded).
+
+    if not gate.allowed:
+        return Decision("rate_limited", "none", gate.reason, 0,
+                        human=gate.reason == "max_clicks")
+    return Decision("login_panel_skeleton", "click", "pending", 0, click=True)
+
+
+def settle_decision(after: WindowGeometry | None) -> Decision:
+    """Success means the window grew past the logged-in width threshold."""
+    if after is not None and after.w > MAIN_WINDOW_MIN_W:
+        return Decision("click_restored", "clicked", "success", 0, click=True)
+    return Decision("click_ineffective", "clicked", "still_login_panel", 3, click=True)
+
+
+# --- rate limiting -----------------------------------------------------------
+def read_boot_id(path: str = DEFAULT_BOOT_ID_PATH) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def load_state(path: str, boot_id: str) -> dict:
+    state = {"boot_id": boot_id, "clicks": [], "human_required": False}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return state
+    if not isinstance(raw, dict):
+        return state
+    if boot_id and raw.get("boot_id") != boot_id:
+        return state  # new boot: the click budget is per boot
+    clicks = [c for c in raw.get("clicks", []) if isinstance(c, (int, float))]
+    state["clicks"] = clicks
+    state["human_required"] = bool(raw.get("human_required", False))
+    return state
+
+
+def save_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def rate_gate(state: dict, now: float,
+              max_clicks: int = MAX_CLICKS_PER_BOOT,
+              min_interval: float = MIN_CLICK_INTERVAL_SEC) -> RateGate:
+    clicks = list(state.get("clicks", []))
+    if len(clicks) >= max_clicks:
+        return RateGate(False, "max_clicks")
+    if clicks and now - max(clicks) < min_interval:
+        return RateGate(False, "min_interval")
+    return RateGate(True, "ok")
+
+
+# --- external commands -------------------------------------------------------
+def _run(cmd: list[str], *, env: dict,
+         timeout: int = COMMAND_TIMEOUT_SEC) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(cmd, capture_output=True, env=env, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _x_env(display: str) -> dict:
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    return env
+
+
+def read_window_geometry(display: str) -> WindowGeometry | None:
+    result = _run(["xwininfo", "-display", display, "-root", "-tree"], env=_x_env(display))
+    if result is None or result.returncode != 0:
+        return None
+    return parse_geometry(result.stdout.decode("utf-8", "replace"))
+
+
+def capture_window_frame(display: str, geom: WindowGeometry) -> bytes | None:
+    """Grab exactly the window rectangle as raw gray (WxH bytes).
+
+    x11grab's `DISPLAY+X,Y` input form anchors the grab at the window origin, so
+    every later crop is window-relative — the screen origin is irrelevant (the
+    window sits at +494,+202 on the live host, never at 0,0).
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-f", "x11grab", "-draw_mouse", "0",
+        "-video_size", f"{geom.w}x{geom.h}",
+        "-i", f"{display}+{geom.x},{geom.y}",
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    result = _run(cmd, env=_x_env(display))
+    if result is None or result.returncode != 0:
+        return None
+    if len(result.stdout) != geom.w * geom.h:
+        return None
+    return result.stdout
+
+
+def write_pgm(path: str, region: bytes, width: int, height: int) -> bool:
+    try:
+        with open(path, "wb") as handle:
+            handle.write(f"P5\n{width} {height}\n255\n".encode("ascii"))
+            handle.write(region)
+        return True
+    except OSError:
+        return False
+
+
+def ocr_languages() -> set[str] | None:
+    result = _run(["tesseract", "--list-langs"], env=dict(os.environ))
+    if result is None or result.returncode != 0:
+        return None
+    langs: set[str] = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        value = line.strip()
+        if not value or "List of available" in value or "/" in value or value.endswith(":"):
+            continue
+        langs.add(value)
+    return langs
+
+
+def ocr_pgm(path: str, lang: str, psm: str) -> str | None:
+    result = _run(["tesseract", path, "stdout", "-l", lang, "--psm", psm],
+                  env=dict(os.environ))
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", "replace")
+
+
+def read_ocr(frame: bytes, geom: WindowGeometry, lang: str,
+             workdir: str) -> tuple[OcrResult | None, str]:
+    """Run whole-window + button-region OCR. Returns (result, status)."""
+    whole = crop_bytes(frame, geom.w, (0, 0, geom.w, geom.h))
+    button = crop_bytes(frame, geom.w, BUTTON_LABEL_BOX)
+    if whole is None or button is None:
+        return None, OCR_STATUS_FAILED
+    whole_path = os.path.join(workdir, "frame-whole.pgm")
+    button_path = os.path.join(workdir, "frame-button.pgm")
+    if not write_pgm(whole_path, *whole) or not write_pgm(button_path, *button):
+        return None, OCR_STATUS_FAILED
+    whole_text = ocr_pgm(whole_path, lang, OCR_PSM_WHOLE)
+    button_text = ocr_pgm(button_path, lang, OCR_PSM_BUTTON)
+    if whole_text is None or button_text is None:
+        return None, OCR_STATUS_FAILED
+    return interpret_ocr(whole_text, button_text), OCR_STATUS_OK
+
+
+def click_login_button(display: str, geom: WindowGeometry) -> bool:
+    x = geom.x + CLICK_OFFSET[0]
+    y = geom.y + CLICK_OFFSET[1]
+    if _run(["xdotool", "mousemove", str(x), str(y), "click", "1"], env=_x_env(display)) is None:
+        return False
+    _run(["xdotool", "mousemove", str(PARK_POINTER[0]), str(PARK_POINTER[1])], env=_x_env(display))
+    return True
+
+
+# --- logging -----------------------------------------------------------------
+def fmt_geometry(geom: WindowGeometry | None) -> str:
+    return "none" if geom is None else f"{geom.w}x{geom.h}+{geom.x}+{geom.y}"
+
+
+def fmt_stats(stats: QrStats | None) -> str:
+    if stats is None:
+        return "none"
+    return (
+        f"(mean={stats.mean:.1f},std={stats.std:.1f},trans={stats.transitions:.2f},"
+        f"hi={stats.frac_hi:.2f},lo={stats.frac_lo:.2f})"
+    )
+
+
+def emit(event: str, geom: WindowGeometry | None = None, stats: QrStats | None = None,
+         action: str = "none", outcome: str = "", extra: str = "",
+         level: str = "info") -> None:
+    fields = [
+        f"level={level}",
+        f"event={event}",
+        f"geometry={fmt_geometry(geom)}",
+        f"stats={fmt_stats(stats)}",
+        f"action={action}",
+        f"outcome={outcome}",
+    ]
+    if extra:
+        fields.append(extra)
+    print(f"{TAG}: " + " ".join(fields), flush=True)
+
+
+# --- filesystem seams --------------------------------------------------------
+def _usable_dir(path: str) -> bool:
+    """True when `path` is a writable directory we may own files in.
+
+    `makedirs(..., exist_ok=True)` still raises when something that is NOT a
+    directory occupies the path (e.g. a file left behind by a deploy), so this
+    swallows that and falls through to the next candidate.
+    """
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError:
+        return False
+    return os.path.isdir(path) and os.access(path, os.W_OK)
+
+
+def resolve_state_dir() -> str:
+    wanted = os.environ.get("GUARD_STATE_DIR") or DEFAULT_STATE_DIR
+    candidates = [wanted, FALLBACK_DIR, f"{FALLBACK_DIR}-{os.getuid()}"]
+    for candidate in candidates:
+        if _usable_dir(candidate):
+            return candidate
+    return FALLBACK_DIR
+
+
+def acquire_lock(path: str, state_dir: str | None = None) -> tuple[int | None, str]:
+    """Exclusive non-blocking flock; falls back to /tmp when the path is unwritable."""
+    flat_fallback = "/tmp/wechat-login-guard.lock"
+    candidates = [path, flat_fallback]
+    if state_dir:
+        candidates.append(os.path.join(state_dir, "wechat-login-guard.lock"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            parent = os.path.dirname(candidate)
+            if parent:
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            fd = os.open(candidate, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None, "busy"
+        return fd, candidate
+    return None, "unavailable"
+
+
+# --- entry point -------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=TAG,
+        description="Click the WeChat login panel once when OCR reads 进入微信 and the "
+                    "QR card is the gray skeleton (never when a real QR is shown).",
+    )
+    parser.add_argument("--check", action="store_true",
+                        help="report the decision without clicking (dry run)")
+    args = parser.parse_args(argv)
+
+    display = os.environ.get("DISPLAY") or DEFAULT_DISPLAY
+    lock_path = os.environ.get("GUARD_LOCK_PATH") or DEFAULT_LOCK_PATH
+    boot_id_path = os.environ.get("GUARD_BOOT_ID_PATH") or DEFAULT_BOOT_ID_PATH
+    ocr_lang = os.environ.get("GUARD_OCR_LANG") or DEFAULT_OCR_LANG
+    try:
+        settle = max(0.0, float(os.environ.get("GUARD_SETTLE_SEC", "20")))
+    except ValueError:
+        settle = 20.0
+
+    state_dir = resolve_state_dir()
+    state_path = os.path.join(state_dir, STATE_FILE_NAME)
+    boot_id = read_boot_id(boot_id_path)
+    state = load_state(state_path, boot_id)
+
+    lock_fd, lock_used = acquire_lock(lock_path, state_dir)
+    if lock_fd is None:
+        emit("locked", action="none", outcome=lock_used, level="warn",
+             extra=f"lock={lock_used}")
+        return 0
+
+    workdir = tempfile.mkdtemp(prefix="wechat-login-guard-")
+    try:
+        langs = ocr_languages()
+        if langs is None or "chi_sim" not in langs:
+            ocr_status = OCR_STATUS_UNAVAILABLE
+        else:
+            ocr_status = OCR_STATUS_OK
+
+        geom = read_window_geometry(display)
+        stats = None
+        ocr: OcrResult | None = None
+        if geom is not None and geom.w <= MAIN_WINDOW_MIN_W and within_login_tolerance(geom):
+            frame = capture_window_frame(display, geom)
+            if frame is not None:
+                stats = compute_stats(frame, geom.w, QR_CARD_BOX)
+                if ocr_status == OCR_STATUS_OK:
+                    ocr, ocr_status = read_ocr(frame, geom, ocr_lang, workdir)
+
+        gate = rate_gate(state, time.time())
+        decision = decide(geom, stats, ocr, gate, ocr_status)
+
+        ocr_extra = f"ocr={ocr_status}"
+        if ocr is not None and ocr.text:
+            ocr_extra += ' ocr_text="' + ocr.text.replace('"', "")[:120] + '"'
+
+        def log_outcome(event: str, action: str, outcome: str, level: str,
+                        detail: str = "") -> None:
+            extra = ocr_extra if ocr_extra else ""
+            if detail:
+                extra = (extra + " " + detail).strip()
+            emit(event, geom, stats, action=action, outcome=outcome,
+                 level=level, extra=extra)
+
+        if decision.human:
+            # Once per boot: ambiguity is expected to persist until a human acts.
+            if not state.get("human_required"):
+                emit("human_required", geom, stats, action="none",
+                     outcome="real_qr_scan_or_device_session_lost", level="warn",
+                     extra=f"reason={decision.outcome} {ocr_extra}".strip())
+                state["human_required"] = True
+                if not args.check:
+                    save_state(state_path, state)
+
+        if decision.event in ("unknown_geometry", "qr_like", "ocr_veto", "ocr_no_label",
+                              "ocr_failed", "rate_limited"):
+            log_outcome(decision.event, "none", decision.outcome, "warn", decision.detail)
+            return 0
+
+        if decision.event in ("capture_failed",):
+            log_outcome(decision.event, "none", decision.outcome, "warn", decision.detail)
+            return 2
+
+        if not decision.click:
+            log_outcome(decision.event, "none", decision.outcome, "info")
+            return decision.exit_code
+
+        if args.check:
+            log_outcome(decision.event, "would_click", f"dry_run({decision.outcome})", "info")
+            return 0
+
+        log_outcome(decision.event, "click", "pending", "info",
+                    f"settle={settle:.0f}s")
+        if not click_login_button(display, geom):
+            log_outcome("click_failed", "click", "xdotool_error", "warn")
+            return 3
+
+        state.setdefault("clicks", []).append(time.time())
+        save_state(state_path, state)
+
+        if settle:
+            time.sleep(settle)
+
+        after = read_window_geometry(display)
+        final = settle_decision(after)
+        if final.exit_code == 0:
+            state["clicks"] = []
+            state["human_required"] = False
+            save_state(state_path, state)
+        emit(final.event, after, None, action="click", outcome=final.outcome,
+             level="info" if final.exit_code == 0 else "warn",
+             extra=f"before={fmt_geometry(geom)} after={fmt_geometry(after)}")
+        return final.exit_code
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

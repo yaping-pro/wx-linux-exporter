@@ -1,0 +1,22 @@
+[Unit]
+Description=WeChat Login Panel Auto-Click Guard (one-shot)
+After=wechat-runner.service
+Wants=wechat-runner.service
+
+[Service]
+Type=oneshot
+User=steven
+Environment=DISPLAY=:99
+ExecStart=/usr/local/bin/wechat-login-guard
+# Per-boot click budget lives here (/var/lib/wechat-login-guard/state.json);
+# systemd creates it owned by User= so the guard never silently falls back to /tmp.
+StateDirectory=wechat-login-guard
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+# X access is required by design: the guard drives xwininfo/xdotool/ffmpeg on :99,
+# so do NOT add ProtectSystem=strict/PrivateDevices/namespace hardening that hides
+# /tmp/.X11-unix. PrivateTmp only namespaces /tmp for this unit; X11 local clients
+# reach :99 through the abstract socket, and a failure would be fail-closed
+# (every run logs capture_failed, nothing ever gets clicked).
+TimeoutStartSec=120

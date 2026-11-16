@@ -13,6 +13,7 @@
 - **交流入口收敛 (`README.md`, `assets/wechat-group-qr.png`)**：微信群二维码 7 天即过期（当前有效期至 2026-10-20），已从 README 下线并删除图片资源，避免向读者展示无法加入的死码；社区唯一入口固定为 Telegram 群组 `t.me/WeChatExporter`，问题反馈走 GitHub Issue。
 
 ### Added
+- **微信登录面板自愈 `wechat-login-guard` (`deploy/host/wechat-login-guard`, `deploy/systemd/wechat-login-guard.{service,timer}`, `docs/OPS.md` §7)**：主机重启后微信客户端停在 `292x396` 登录面板等人，数据源静默（2026-11-13 中断 4 天、2026-11-16 复发 16h）。新增 one-shot 守卫，5min 一次、每 boot 最多点击 3 次、两次间隔 ≥600s，仅在**残留设备会话**时点击窗口相对 `+145,+306`（「进入微信」）恢复会话。安全不变量：真二维码一律不点——硬否决由像素分类器（卡片均值/σ/亮暗占比/每行跳变）承担，OCR（tesseract `chi_sim` 读出「进入微信」且全窗无「扫码登录/切换账号/仅传输文件」）为主判据；歧义只记一条 `event=human_required`。不再需要人工点登录页，但真掉线仍需人工扫码（Xvfb 不可见）。
 - **Muse 消费端生产全量上线与手写排班表视觉验收 (`docs/INTEGRATIONS.md`)**：
   - 消费端 `fetch_wechat.py` 启用 `--media`（带 `media=image&ocr=none`）与自动落盘/生命周期清理；
   - 4 项巡检 Cron（08:14/12:14/16:14/20:14）与 1 项早报 Cron（08:10）全量切换并回读验证；

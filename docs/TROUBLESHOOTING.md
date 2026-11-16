@@ -89,6 +89,11 @@ find ~/Documents/xwechat_files -name "*.db-wal" -newermt "-3 minutes" | head   #
 追到当下，`wechat-decrypt.timer` 下一轮发布即带回当天全部消息。这是家服无人值守的最大单点：
 **主机重启后必须有人点一下登录页**（或扫码），否则数据源永久静默。
 
+> 2026-11-16 起有自动化兜底：[`deploy/host/wechat-login-guard`](../deploy/host/wechat-login-guard)
+> 由 `wechat-login-guard.timer` 每 5min 跑一次，在**残留设备会话**时自动点击「进入微信」，
+> 真二维码（像素双峰纹理 / OCR 读出「扫码登录」等）一律不点。判据、journal 读法与回滚见
+> [`OPS.md`](OPS.md) §7；真掉线仍需人工扫码（Xvfb 不可见）。
+
 **(b) timer 重启后永久静默（发布链路死了）**
 
 ```bash

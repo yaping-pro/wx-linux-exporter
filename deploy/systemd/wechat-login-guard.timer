@@ -1,0 +1,19 @@
+[Unit]
+Description=Periodic WeChat Login Panel Auto-Click Guard
+
+[Timer]
+# Fire once 2min after boot (WeChat needs a moment to reach the login panel), then
+# every 5min while the panel persists. The guard exits immediately once logged in,
+# so this is a cheap no-op on a healthy host.
+# NOTE: never write `OnUnitActiveSec=` (empty) — an empty list-type assignment wipes
+# every trigger of the timer, including OnBootSec. See docs/OPS.md §7 and §6(b) in
+# docs/TROUBLESHOOTING.md.
+OnBootSec=120s
+OnUnitActiveSec=300s
+AccuracySec=30s
+# A missed tick while the box is off is irrelevant: the next boot re-arms OnBootSec.
+Persistent=false
+Unit=wechat-login-guard.service
+
+[Install]
+WantedBy=timers.target

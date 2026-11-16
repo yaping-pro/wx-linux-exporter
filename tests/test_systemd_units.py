@@ -96,5 +96,50 @@ class SystemdTimerGuardTest(unittest.TestCase):
                 )
 
 
+class WechatLoginGuardUnitTest(unittest.TestCase):
+    """守卫 wechat-login-guard：登录页自愈单元必须是 one-shot、5min 节拍、可读 journal。
+
+    见 docs/OPS.md §7。安全不变量（绝不点真二维码）在脚本里，这里只固化部署形态。
+    """
+
+    SERVICE = SYSTEMD_DIR / "wechat-login-guard.service"
+    TIMER = SYSTEMD_DIR / "wechat-login-guard.timer"
+
+    def values(self, unit: Path) -> dict[str, str]:
+        self.assertTrue(unit.is_file(), f"缺少 {unit.name}")
+        return {key: value for key, value in _assignments(unit.read_text(encoding="utf-8"))}
+
+    def test_service_runs_as_the_xvfb_owner_one_shot(self) -> None:
+        values = self.values(self.SERVICE)
+        self.assertEqual(values.get("User"), "steven")
+        self.assertEqual(values.get("Type"), "oneshot")
+        self.assertEqual(values.get("ExecStart"), "/usr/local/bin/wechat-login-guard")
+        self.assertEqual(values.get("Environment"), "DISPLAY=:99")
+
+    def test_service_hardening_keeps_x_access(self) -> None:
+        values = self.values(self.SERVICE)
+        self.assertEqual(values.get("NoNewPrivileges"), "yes")
+        self.assertEqual(values.get("PrivateTmp"), "yes")
+        # 不得把 X socket 沙箱掉：脚本要用 xwininfo/xdotool/ffmpeg 驱动 :99。
+        self.assertNotIn("PrivateNetwork", values)
+        self.assertNotIn("RestrictAddressFamilies", values)
+
+    def test_service_provides_persistent_state_dir(self) -> None:
+        """点击预算落盘在 /var/lib/wechat-login-guard；缺 StateDirectory 会静默退回 /tmp。"""
+        values = self.values(self.SERVICE)
+        self.assertEqual(values.get("StateDirectory"), "wechat-login-guard")
+
+    def test_timer_schedule_is_present_and_non_empty(self) -> None:
+        values = self.values(self.TIMER)
+        self.assertEqual(values.get("OnBootSec"), "120s")
+        self.assertEqual(values.get("OnUnitActiveSec"), "300s")
+        self.assertEqual(values.get("AccuracySec"), "30s")
+        self.assertEqual(values.get("Persistent"), "false")
+        self.assertEqual(values.get("Unit"), "wechat-login-guard.service")
+        for key in ("OnBootSec", "OnUnitActiveSec"):
+            self.assertTrue(values.get(key, "").strip(), f"{self.TIMER.name} 的 {key} 不能为空")
+        self.assertNotIn("OnCalendar", values, "不要引入 OnCalendar，避免空赋值重置整张触发列表")
+
+
 if __name__ == "__main__":
     _ = unittest.main(verbosity=2)
