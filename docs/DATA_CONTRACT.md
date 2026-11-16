@@ -130,6 +130,16 @@
 ```json
 { "status": "ok" }
 ```
+- **源数据新鲜度（叠加字段，不改变响应语义）**：上例的 `status` 与 HTTP `200` 语义**保持不变**（既有探针"非 000 即活"不受影响）。`wechat-export-api` 额外返回以下只读字段，用于识别"微信已登出但水位虚假推进"的假绿：
+
+  | 字段 | 类型 | 说明 |
+  | :--- | :--- | :--- |
+  | `published_at` | string (RFC3339) \| null | 当前已发布快照的时间，取自 `state/last_publish.json`；缺失时回退为快照目录 mtime |
+  | `source_max_ts` | string (RFC3339) \| null | 已发布快照内消息的最大 `create_time`（只读快照 DB，不触碰在线微信库） |
+  | `source_rows` | integer | 已发布快照内的消息总行数 |
+  | `source_status` | `"fresh"` \| `"stale"` | `stale` = `source_rows == 0` 或 `now - source_max_ts > WECHAT_EXPORT_FRESHNESS_SEC` |
+
+  新鲜度阈值由环境变量 `WECHAT_EXPORT_FRESHNESS_SEC` 控制，**默认 `21600`（6 小时）**；非法或非正值回退默认值。`status` 不因源数据陈旧而改变，消费端必须读取 `source_status`。
 #### (2) `GET /api/wechat/export`
 - **功能**：增量/全量拉取结构化消息快照。
 - **请求参数**：

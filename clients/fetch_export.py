@@ -286,11 +286,48 @@ def main():
     h_uds = h_data.get("uds_connected", False)
     h_total = h_data.get("total_messages")
 
+    # Source freshness published by /health from the published vault snapshot itself.
+    # Older daemons omit these keys; absence falls back to the last_nonempty_at rule.
+    h_source_status = h_data.get("source_status")
+    h_source_rows = h_data.get("source_rows")
+    if isinstance(h_source_rows, bool) or not isinstance(h_source_rows, int):
+        h_source_rows = None
+    h_source_max_ts_raw = h_data.get("source_max_ts")
+    h_source_max_ts = None
+    if isinstance(h_source_max_ts_raw, str) and h_source_max_ts_raw.strip():
+        _raw_ts = h_source_max_ts_raw.strip()
+        if _raw_ts.endswith(("Z", "z")):
+            _raw_ts = _raw_ts[:-1] + "+00:00"
+        h_source_max_ts = parse_iso(_raw_ts)
+        if h_source_max_ts is not None and h_source_max_ts.tzinfo is None:
+            h_source_max_ts = h_source_max_ts.replace(tzinfo=datetime.timezone.utc)
+    h_source_known = (
+        h_source_status in ("fresh", "stale")
+        or h_source_rows is not None
+        or h_source_max_ts is not None
+    )
+    source_max_age_min = None
+    if h_source_max_ts is not None:
+        source_max_age_min = round((now - h_source_max_ts).total_seconds() / 60.0, 1)
+
     state = load_state()
     last_wm = state.get("last_watermark")
     last_total = state.get("last_total_messages")
     last_uptime = state.get("last_uptime")
     reset_count = state.get("uptime_reset_count", 0)
+
+    # Track the last time we actually received messages. The watermark alone cannot
+    # prove freshness: after a WeChat logout the API degrades to chats=[] with
+    # watermark=range.to=now, so a watermark-age check never fires.
+    last_nonempty_raw = state.get("last_nonempty_at")
+    last_nonempty = parse_iso(last_nonempty_raw) if isinstance(last_nonempty_raw, str) else None
+    if last_nonempty is not None and last_nonempty.tzinfo is None:
+        last_nonempty = last_nonempty.replace(tzinfo=datetime.timezone.utc)
+    if msg_count > 0:
+        last_nonempty = now
+    elif last_nonempty is None:
+        # First run with empty state: bootstrap instead of alerting (avoid alert storm).
+        last_nonempty = now
 
     if last_uptime is not None and h_uptime < last_uptime:
         reset_count += 1
@@ -335,8 +372,48 @@ def main():
                     stale = True
                     stale_reason = f"daemon uptime is invalid ({h_uptime})"
 
+    # False-green fix: a fresh-looking watermark with zero served messages is either
+    # a legitimate quiet period or a frozen source (e.g. WeChat logged out). Prefer the
+    # export API's own snapshot freshness; only when the daemon predates those fields
+    # fall back to the last_nonempty_at age rule.
+    quiet_empty = False
+    if not stale and msg_count == 0:
+        if h_source_known:
+            source_frozen = (
+                h_source_status == "stale"
+                or h_source_rows == 0
+                or (source_max_age_min is not None and source_max_age_min > FRESHNESS_MIN)
+            )
+            if source_frozen:
+                stale = True
+                age_txt = (
+                    f"{source_max_age_min:.1f} min"
+                    if source_max_age_min is not None
+                    else "unknown"
+                )
+                stale_reason = (
+                    "no messages served and export source is frozen "
+                    f"(source_status={h_source_status}, source_rows={h_source_rows}, "
+                    f"source_max_ts={h_source_max_ts_raw}, source_max_age={age_txt} > "
+                    f"{FRESHNESS_MIN} min)"
+                )
+            else:
+                # Source is healthy; empty run is a genuine quiet period.
+                quiet_empty = True
+        elif last_nonempty is not None:
+            nonempty_age_min = (now - last_nonempty).total_seconds() / 60.0
+            if nonempty_age_min > FRESHNESS_MIN:
+                stale = True
+                stale_reason = (
+                    f"no messages served and last non-empty export was "
+                    f"{last_nonempty.isoformat()} ({nonempty_age_min:.1f} min ago > "
+                    f"{FRESHNESS_MIN} min)"
+                )
+
     if stale:
         verdict = "STALE"
+    elif quiet_empty:
+        verdict = "ok(quiet)"
     elif watermark is not None and last_wm is not None and watermark.isoformat() == last_wm:
         if age_min is not None and age_min > FRESHNESS_MIN:
             verdict = "ok(quiet)"
@@ -351,11 +428,17 @@ def main():
     print(f"endpoint : {used_url}")
     if h_data:
         print(f"health   : status={h_status}, uptime={h_uptime}s, uds={'connected' if h_uds else 'disconnected'}, total_msgs={h_total}")
+        print(
+            f"source   : status={h_source_status}, rows={h_source_rows}, "
+            f"max_ts={h_source_max_ts_raw} (age_min={source_max_age_min}, "
+            f"freshness_limit={FRESHNESS_MIN})"
+        )
     print(f"chats    : {len(chats)}")
     print(f"messages : {msg_count}")
     print(f"sha256   : {sha}")
     print(f"watermark: {data.get('watermark')} (age_min={age_min}, freshness_limit={FRESHNESS_MIN})")
     print(f"last_wm  : {last_wm}")
+    print(f"last_nonempty: {last_nonempty.isoformat() if last_nonempty else None}")
     print(f"RESULT   : {verdict}")
 
     if stale:
@@ -374,9 +457,15 @@ def main():
         "last_uptime": h_uptime,
         "last_uds_connected": h_uds,
         "uptime_reset_count": reset_count,
+        "last_nonempty_at": last_nonempty.isoformat() if last_nonempty else None,
     })
     return 0
 
 
 if __name__ == "__main__":
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        print(__doc__.strip())
+        print("\nRuns with no arguments; configure via env (WX_EXPORT_ENDPOINT, "
+              "WX_STATE_FILE, WX_FRESHNESS_MINUTES, ...).")
+        sys.exit(0)
     sys.exit(main())

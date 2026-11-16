@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock as _mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -298,6 +299,70 @@ class MediaImagesUnitTests(unittest.TestCase):
         self.assertFalse(anchor_def["additionalProperties"])
         for f in ("chat_id", "chat_name", "local_id", "ts", "sender"):
             self.assertIn(f, anchor_def["required"])
+
+    def test_schema_root_pagination_fields(self):
+        """测试根级 next_cursor 与 payload_stats.truncated 的分页契约。"""
+        schema_path = REPO_ROOT / "schema" / "export.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+        # 根级 next_cursor：可为 null（无剩余）或 base64url 字符串
+        self.assertIn("next_cursor", schema["properties"])
+        self.assertEqual(sorted(schema["properties"]["next_cursor"]["type"]), ["null", "string"])
+        self.assertFalse(schema["additionalProperties"])
+
+        # payload_stats.truncated：必填布尔
+        stats = schema["properties"]["payload_stats"]
+        self.assertFalse(stats["additionalProperties"])
+        self.assertIn("truncated", stats["required"])
+        self.assertEqual(stats["properties"]["truncated"]["type"], "boolean")
+
+    def test_health_source_freshness_fresh_and_stale(self):
+        """/health 新鲜度辅助函数：行数/max_ts 决定 fresh|stale，且 published_at 可回退。"""
+        import os
+
+        vault = self.tmp / "vault"
+        _build_test_databases(
+            vault,
+            chats=[("wxid_test", "", "测试", False)],
+            messages=[("wxid_test", 1, 1759000000, 1, "hi")],
+        )
+        with _mock.patch.dict(os.environ, {"WECHAT_EXPORT_FRESHNESS_SEC": "21600"}):
+            fresh = wechat_export_api.get_source_freshness(vault, now=1759000060)
+            stale = wechat_export_api.get_source_freshness(
+                vault, now=1759000000 + 21600 + 1
+            )
+            empty = self.tmp / "empty_vault"
+            empty.mkdir()
+            empty_stats = wechat_export_api.get_source_freshness(empty, now=1759000060)
+
+        self.assertEqual(fresh["source_rows"], 1)
+        self.assertIsNotNone(fresh["source_max_ts"])
+        self.assertEqual(fresh["source_status"], "fresh")
+        # 无 last_publish.json 时回退快照目录 mtime，不应为 null
+        self.assertIsNotNone(fresh["published_at"])
+        self.assertEqual(stale["source_status"], "stale")
+        self.assertEqual(empty_stats["source_rows"], 0)
+        self.assertIsNone(empty_stats["source_max_ts"])
+        self.assertEqual(empty_stats["source_status"], "stale")
+
+        # 生产布局：<vault>/decrypted/current + <vault>/state/last_publish.json
+        vault_root = self.tmp / "vault_root"
+        current = vault_root / "decrypted" / "current"
+        _build_test_databases(
+            current,
+            chats=[("wxid_test", "", "测试", False)],
+            messages=[("wxid_test", 1, 1759000000, 1, "hi")],
+        )
+        (vault_root / "state").mkdir(parents=True)
+        published = "2026-11-16T08:00:00+08:00"
+        (vault_root / "state" / "last_publish.json").write_text(
+            json.dumps({"published_at": published}), encoding="utf-8"
+        )
+        with _mock.patch.dict(os.environ, {"WECHAT_EXPORT_FRESHNESS_SEC": "21600"}):
+            prod = wechat_export_api.get_source_freshness(current, now=1759000060)
+        self.assertEqual(prod["published_at"], published)
+        self.assertEqual(prod["source_rows"], 1)
+        self.assertEqual(prod["source_status"], "fresh")
 
     def test_image_note_mappings(self):
         """测试 8 种状态/原因到消费端 note 的细化映射规则。"""
@@ -1077,6 +1142,17 @@ class HttpApiEndpointsIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status_304, 304)
         self.assertEqual(body_304, b"")
+
+    def test_health_reports_source_freshness_additively(self):
+        """测试 /health 保持 status=ok 且叠加 published_at/source_max_ts/source_rows/source_status。"""
+        status, body, _ = self._req("/health", token=None)
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["status"], "ok")
+        for key in ("published_at", "source_max_ts", "source_rows", "source_status"):
+            self.assertIn(key, data)
+        self.assertIsInstance(data["source_rows"], int)
+        self.assertIn(data["source_status"], ("fresh", "stale"))
 
     def test_media_file_path_traversal_and_security(self):
         """测试路径穿越防御、文件名扩展名白名单与 blocklist 隔离。"""

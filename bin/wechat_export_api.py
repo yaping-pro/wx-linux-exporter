@@ -168,6 +168,151 @@ def format_rfc3339(epoch_sec: float | int) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+# ── /health source freshness ──────────────────────────────────────────────────
+# 2026-11-13: a WeChat desktop logout made the export degrade to ``chats=[]`` and
+# ``watermark = range.to = now``, so "watermark == now" cannot prove freshness.
+# /health therefore reports the published snapshot's own age. Default limit is
+# 6 hours (21600 s); override with WECHAT_EXPORT_FRESHNESS_SEC.
+DEFAULT_FRESHNESS_SEC = 21600
+_SOURCE_STATS_TTL_SEC = 60
+_SOURCE_STATS_CACHE: dict[str, tuple[float, tuple[int, float | None]]] = {}
+
+
+def freshness_limit_sec() -> int:
+    """Freshness limit in seconds; defaults to 6h when env is absent/invalid."""
+    raw = os.environ.get("WECHAT_EXPORT_FRESHNESS_SEC")
+    if raw is None:
+        return DEFAULT_FRESHNESS_SEC
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FRESHNESS_SEC
+    return value if value > 0 else DEFAULT_FRESHNESS_SEC
+
+
+def _vault_root_from_snapshot(vault_dir: Path | str, server_context: dict[str, Any] | None = None) -> Path:
+    """Resolve the vault root (parent of decrypted/ and state/) from a snapshot dir."""
+    ctx = server_context or {}
+    if ctx.get("vault_root"):
+        return Path(str(ctx["vault_root"])).expanduser()
+    p = Path(vault_dir).expanduser()
+    # <vault>/decrypted/current -> <vault>
+    if p.name == "current" and p.parent.name == "decrypted":
+        return p.parent.parent
+    if p.parent.name == "decrypted":
+        return p.parent.parent
+    return p
+
+
+def _snapshot_message_stats(snapshot_dir: Path) -> tuple[int, float | None]:
+    """Count message rows and find the max create_time in the published snapshot.
+
+    Read-only over the vault's message shards; never touches the live WeChat DBs.
+    """
+    rows = 0
+    max_ts: float | None = None
+    for shard in message_db_paths(snapshot_dir):
+        con: sqlite3.Connection | None = None
+        try:
+            try:
+                uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
+                con = sqlite3.connect(uri, uri=True)
+            except Exception:
+                con = sqlite3.connect(str(shard))
+            tables = [
+                r[0]
+                for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg\\_%' ESCAPE '\\'"
+                )
+            ]
+            for table in tables:
+                try:
+                    row = con.execute(
+                        f"SELECT COUNT(*), MAX(create_time) FROM [{table}]"
+                    ).fetchone()
+                except sqlite3.Error:
+                    continue
+                rows += int(row[0] or 0)
+                if row[1] is not None:
+                    ts = float(row[1])
+                    max_ts = ts if max_ts is None else max(max_ts, ts)
+        except sqlite3.Error:
+            continue
+        finally:
+            if con is not None:
+                con.close()
+    return rows, max_ts
+
+
+def _snapshot_message_stats_cached(snapshot_dir: Path) -> tuple[int, float | None]:
+    """Cache snapshot stats briefly so the unauthenticated health probe stays cheap."""
+    try:
+        key = str(snapshot_dir.resolve())
+    except OSError:
+        key = str(snapshot_dir)
+    now = time.time()
+    hit = _SOURCE_STATS_CACHE.get(key)
+    if hit is not None and (now - hit[0]) < _SOURCE_STATS_TTL_SEC:
+        return hit[1]
+    stats = _snapshot_message_stats(Path(key))
+    _SOURCE_STATS_CACHE[key] = (now, stats)
+    return stats
+
+
+def _read_published_at(snapshot_dir: Path, vault_root: Path) -> tuple[str | None, float | None]:
+    """Read last_publish.json published_at; fall back to the snapshot dir mtime."""
+    candidates = (
+        vault_root / "state" / "last_publish.json",
+        snapshot_dir / "state" / "last_publish.json",
+        snapshot_dir.parent / "state" / "last_publish.json",
+    )
+    for path in candidates:
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        published_at = info.get("published_at")
+        if not isinstance(published_at, str) or not published_at.strip():
+            continue
+        try:
+            epoch = datetime.fromisoformat(published_at.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        return published_at, epoch
+    try:
+        mtime = snapshot_dir.stat().st_mtime
+    except OSError:
+        return None, None
+    return format_rfc3339(mtime), mtime
+
+
+def get_source_freshness(
+    vault_dir: Path | str,
+    server_context: dict[str, Any] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Describe how old the published vault snapshot is, for /health.
+
+    Returns additive fields only; callers keep ``status: "ok"`` untouched so existing
+    liveness probes ("非 000 即活") never regress into false failures.
+    """
+    now_epoch = time.time() if now is None else float(now)
+    snapshot_dir = Path(vault_dir).expanduser()
+    vault_root = _vault_root_from_snapshot(snapshot_dir, server_context)
+    published_at, _published_epoch = _read_published_at(snapshot_dir, vault_root)
+    rows, max_ts = _snapshot_message_stats_cached(snapshot_dir)
+    limit = freshness_limit_sec()
+    stale = rows == 0 or max_ts is None or (now_epoch - max_ts) > limit
+    return {
+        "published_at": published_at,
+        "source_max_ts": format_rfc3339(max_ts) if max_ts is not None else None,
+        "source_rows": int(rows),
+        "source_status": "stale" if stale else "fresh",
+    }
+
+
 def parse_time_param(val: str | None, default_epoch: float) -> float:
     """Parse time string (epoch or RFC3339/ISO8601) to epoch seconds."""
     if not val:
@@ -997,7 +1142,25 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
             # data, only service status. `/api/wechat/export` always requires a Bearer
             # token. This two-tier policy is documented in docs/API_SPEC.md,
             # docs/DATA_CONTRACT.md, and AGENT.md.
-            self.send_json(200, {"status": "ok"})
+            # Additive freshness fields: status stays "ok" and HTTP stays 200 so
+            # existing probes keep working; staleness is signalled only via source_status.
+            payload: dict[str, Any] = {"status": "ok"}
+            try:
+                vault_dir = Path(
+                    self.server_context.get(
+                        "vault_dir", "~/.local/share/wechat-vault/decrypted/current"
+                    )
+                ).expanduser()
+                payload.update(get_source_freshness(vault_dir, self.server_context))
+            except Exception as e:  # never fail the liveness probe
+                self.log_message("health freshness probe failed: %s", e)
+                payload.update({
+                    "published_at": None,
+                    "source_max_ts": None,
+                    "source_rows": 0,
+                    "source_status": "stale",
+                })
+            self.send_json(200, payload)
             return
 
         if path == "/api/health/briefing":

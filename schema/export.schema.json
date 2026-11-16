@@ -42,6 +42,10 @@
       "format": "date-time",
       "description": "Cursor for incremental sync: the max message timestamp in this payload, or 'to' if empty. v1.1: when media enrichment is enabled and a batch contains not-yet-ready media, the server rolls this back to before that message so consumers re-fetch it. Consumers must not assume it is monotonically increasing."
     },
+    "next_cursor": {
+      "type": ["string", "null"],
+      "description": "Pagination resume cursor (v1.3.1): base64url without padding encoding {ts, chat_id, local_id} of the last served message, or null when the whole window was served."
+    },
     "chats": {
       "type": "array",
       "description": "Aggregated chat conversation items.",
@@ -74,7 +78,8 @@
       "required": [
         "messages",
         "media_included",
-        "ocr_chars"
+        "ocr_chars",
+        "truncated"
       ],
       "properties": {
         "messages": {
@@ -91,6 +96,10 @@
           "type": "integer",
           "minimum": 0,
           "description": "Total character count of OCR text included across messages (0 when ocr=none)."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "True when the response was cut by ?limit= and more messages remain (next_cursor is non-null)."
         }
       },
       "additionalProperties": false
