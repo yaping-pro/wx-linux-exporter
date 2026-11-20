@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# wxpad-export-toggle — 一键切换 redmi-wxpad 导出链路的「监控 / 告警 / 隧道守护」层。
+#
+# 背景: redmi-wxpad 导出测试完成后, 周期自检(青龙 wx_export_check)、host 探针
+# (redmi-tailnet-keepalive) 与设备端隧道守护(sfa_watchdog.sh) 会被停掉, 以消除
+# 因设备关机而产生的告警噪声; 但**导出能力本体**(wx_daemon / wx_watchdog.sh /
+# wx_autostart.sh) 始终保持运行, 以便需要导出数据时随时恢复。
+#
+# 本脚本只切换上述"监控层"三项, 绝不触碰导出能力本体。三项均幂等、可逆。
+#
+# 用法:
+#   wxpad-export-toggle up      # 启用: 青龙自检 + host 探针 + 手机隧道守护
+#   wxpad-export-toggle down    # 停用三者(导出能力保留)
+#   wxpad-export-toggle status  # 只读报告当前状态
+#
+# 所有路径/标识可用环境变量覆盖(供测试与迁移):
+#   WXPAD_KEEPALIVE_TIMER  WXPAD_ADB  WXPAD_SERVICE_D  WXPAD_SFA
+#   WXPAD_QL_URL  WXPAD_QL_DB  WXPAD_QL_APP_ID  WXPAD_CRON_ID
+set -uo pipefail
+
+MODE="${1:-status}"
+
+TIMER="${WXPAD_KEEPALIVE_TIMER:-redmi-tailnet-keepalive.timer}"
+ADB_TARGET="${WXPAD_ADB:-192.168.6.167:5555}"
+SERVICE_D="${WXPAD_SERVICE_D:-/data/adb/service.d}"
+SFA="${WXPAD_SFA:-sfa_watchdog.sh}"
+SFA_PID_FILE="${WXPAD_SFA_PID_FILE:-/data/local/tmp/sfa_watchdog.pid}"
+QL_URL="${WXPAD_QL_URL:-http://127.0.0.1:5700}"
+QL_DB="${WXPAD_QL_DB:-/home/steven/Projects/qinglong/data/db/database.sqlite}"
+QL_APP_ID="${WXPAD_QL_APP_ID:-2}"
+CRON_ID="${WXPAD_CRON_ID:-8}"
+TAG=wxpad-export-toggle
+
+rc=0
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; logger -t "$TAG" "$*" 2>/dev/null || true; }
+
+phone()        { adb -s "$ADB_TARGET" shell su -c "$1"; }
+phone_master() { adb -s "$ADB_TARGET" shell su -M -c "$1"; }   # 全局命名空间, kill 需要
+
+# ---- 青龙 OpenAPI: 读写定时任务(id=${CRON_ID})的启停 -----------------------
+ql() {  # $1 = enable | disable | status
+  python3 - "$QL_DB" "$QL_APP_ID" "$QL_URL" "$CRON_ID" "$1" <<'PY'
+import json, sqlite3, sys, urllib.parse, urllib.request
+db, app_id, url, cid, action = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5]
+conn = sqlite3.connect(db)
+cols = [r[1] for r in conn.execute("PRAGMA table_info(Apps)")]
+app = dict(zip(cols, conn.execute("SELECT * FROM Apps WHERE id=?", (app_id,)).fetchone()))
+token = json.load(urllib.request.urlopen(
+    url + "/open/auth/token?" + urllib.parse.urlencode(
+        {"client_id": app["client_id"], "client_secret": app["client_secret"]}), timeout=8))["data"]["token"]
+headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json"}
+if action in ("enable", "disable"):
+    urllib.request.urlopen(urllib.request.Request(
+        url + "/open/crons/" + action, data=("[%d]" % cid).encode(), headers=headers,
+        method="PUT"), timeout=8)
+data = json.load(urllib.request.urlopen(
+    urllib.request.Request(url + "/open/crons/%d" % cid, headers=headers), timeout=8))["data"]
+print("qinglong : id=%d name=%s isDisabled=%s" % (data["id"], data.get("name"), data.get("isDisabled")))
+PY
+}
+
+cmd_status() {
+  local en ac sfa_state daemon
+  en="$(systemctl is-enabled "$TIMER" 2>/dev/null)"; en="${en:-n/a}"
+  ac="$(systemctl is-active  "$TIMER" 2>/dev/null)"; ac="${ac:-n/a}"
+  say "host     : $TIMER -> enabled=$en active=$ac"
+  if [ -n "$(phone "test -e $SERVICE_D/$SFA && echo y")" ]; then
+    sfa_state="启用(在位)"
+  elif [ -n "$(phone "test -e $SERVICE_D/$SFA.disabled && echo y")" ]; then
+    sfa_state="停用(已改名为 .disabled)"
+  else
+    sfa_state="未知(文件缺失)"
+  fi
+  say "phone    : $SFA -> $sfa_state"
+  daemon="$(phone "pidof wx_daemon 2>/dev/null")"
+  say "phone    : 导出本体 wx_daemon -> ${daemon:-未运行} (本脚本不管理)"
+  ql status
+}
+
+cmd_down() {
+  say "== wxpad 导出监控层: 停用 (导出能力保留) =="
+  if systemctl disable --now "$TIMER" >/dev/null 2>&1; then
+    say "host     : $TIMER 已停用"
+  else
+    warn "host     : $TIMER 停用失败"; rc=1
+  fi
+  if [ -n "$(phone "test -e $SERVICE_D/$SFA && echo y")" ]; then
+    if phone "mv $SERVICE_D/$SFA $SERVICE_D/$SFA.disabled"; then
+      say "phone    : $SFA -> $SFA.disabled"
+    else
+      warn "phone    : 改名失败"; rc=1
+    fi
+  else
+    say "phone    : $SFA 已是停用态"
+  fi
+  local pid
+  pid="$(phone "cat $SFA_PID_FILE 2>/dev/null")"
+  if [ -n "$pid" ]; then
+    if phone_master "kill $pid 2>/dev/null"; then
+      say "phone    : 已终止 watchdog pid=$pid"
+    else
+      warn "phone    : 终止 pid=$pid 失败"; rc=1
+    fi
+  fi
+  if ql disable >/dev/null 2>&1; then
+    say "qinglong : 已停用自检任务 id=$CRON_ID"
+  else
+    warn "qinglong : 停用失败"; rc=1
+  fi
+  return "$rc"
+}
+
+cmd_up() {
+  say "== wxpad 导出监控层: 启用 =="
+  if systemctl enable --now "$TIMER" >/dev/null 2>&1; then
+    say "host     : $TIMER 已启用"
+  else
+    warn "host     : $TIMER 启用失败"; rc=1
+  fi
+  if [ -n "$(phone "test -e $SERVICE_D/$SFA.disabled && echo y")" ]; then
+    if phone "mv $SERVICE_D/$SFA.disabled $SERVICE_D/$SFA"; then
+      say "phone    : $SFA.disabled -> $SFA"
+    else
+      warn "phone    : 恢复失败"; rc=1
+    fi
+  else
+    say "phone    : $SFA 已在位"
+  fi
+  if [ -z "$(phone "cat $SFA_PID_FILE 2>/dev/null")" ]; then
+    if phone_master "setsid nohup sh $SERVICE_D/$SFA >/dev/null 2>&1 < /dev/null &"; then
+      say "phone    : watchdog 已启动"
+    else
+      warn "phone    : watchdog 启动失败"; rc=1
+    fi
+  else
+    say "phone    : watchdog 已在运行"
+  fi
+  if ql enable >/dev/null 2>&1; then
+    say "qinglong : 已启用自检任务 id=$CRON_ID"
+  else
+    warn "qinglong : 启用失败"; rc=1
+  fi
+  return "$rc"
+}
+
+case "$MODE" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  *)      say "usage: $(basename "$0") {up|down|status}" >&2; exit 2 ;;
+esac
+exit "$rc"

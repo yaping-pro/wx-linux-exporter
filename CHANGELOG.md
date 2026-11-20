@@ -10,9 +10,11 @@
 - **`wechat-decrypt.timer` 重启后永久静默 (`deploy/systemd/wechat-decrypt.timer`, `tests/test_systemd_units.py`)**：生产主机曾用 `OnUnitActiveSec=` 空赋值（后接 `=5min`）追加 5 分钟节拍——空赋值是**列表重置**，会清空该 timer 的**全部**触发项（含 `OnCalendar`/`OnBootSec`）。主机 2026-11-08 22:46 重启后 `next_elapse=infinity`，vault 索引静默冻结 23 小时，而导出 API 仍返回 200 + 新鲜 watermark（契约规定无新消息时水位退化为 `range.to`），消费端无从察觉。仓库单元改为 `OnCalendar=*:0/5` + `OnBootSec=5min` + `Persistent=true`，并新增静态守卫测试禁止 timer 中出现空值触发项、要求每个 timer 至少有一个重启无关的触发项。
 
 ### Changed
+- **redmi-wxpad 导出链监控/告警暂停，可一键恢复 (`docs/OPS.md` §5.1)**：经确认暂停对青龙 `wx_export_check`（id8）、host `redmi-tailnet-keepalive.timer`、手机 `sfa_watchdog.sh` 的监控/保活/告警三项。**导出能力未下线**——`wx_daemon`（监听 `127.0.0.1:8765`）与其看门狗 `wx_watchdog.sh` / `wx_autostart.sh`、微信本体保持运行。青龙脚本与日志、systemd unit 与 `/usr/local/bin` 二进制、手机 `.disabled` 备份均保留；up/down runbook 见 `docs/OPS.md` §5.1。
 - **交流入口收敛 (`README.md`, `assets/wechat-group-qr.png`)**：微信群二维码 7 天即过期（当前有效期至 2026-10-20），已从 README 下线并删除图片资源，避免向读者展示无法加入的死码；社区唯一入口固定为 Telegram 群组 `t.me/WeChatExporter`，问题反馈走 GitHub Issue。
 
 ### Added
+- **redmi-wxpad 监控层一键切换工具 (`deploy/host/wxpad-export-toggle`, `tests/test_export_toggle.py`, `deploy/install-systemd.sh`)**：新增 `wxpad-export-toggle up|down|status`，幂等可逆地切换导出链路的**监控层**三项（青龙 `wx_export_check`、host `redmi-tailnet-keepalive.timer`、手机 `sfa_watchdog.sh`），**绝不触碰导出能力本体**（`wx_daemon` / `wx_watchdog.sh` / `wx_autostart.sh` 始终运行）；`status` 只读报告含导出本体状态。路径/标识走 `WXPAD_*` 环境变量 seam。`tests/test_export_toggle.py` 5 例（stub PATH 驱动状态机）全绿，已在真机 linux1 跑通 `status`。`deploy/install-systemd.sh` 新增 host 二进制安装段，一并纳管 `redmi-tailnet-keepalive`、`wechat-login-guard`、`wxpad-export-toggle` 到 `/usr/local/bin`。
 - **微信登录面板自愈 `wechat-login-guard` (`deploy/host/wechat-login-guard`, `deploy/systemd/wechat-login-guard.{service,timer}`, `docs/OPS.md` §7)**：主机重启后微信客户端停在 `292x396` 登录面板等人，数据源静默（2026-11-13 中断 4 天、2026-11-16 复发 16h）。新增 one-shot 守卫，5min 一次、每 boot 最多点击 3 次、两次间隔 ≥600s，仅在**残留设备会话**时点击窗口相对 `+145,+306`（「进入微信」）恢复会话。安全不变量：真二维码一律不点——硬否决由像素分类器（卡片均值/σ/亮暗占比/每行跳变）承担，OCR（tesseract `chi_sim` 读出「进入微信」且全窗无「扫码登录/切换账号/仅传输文件」）为主判据；歧义只记一条 `event=human_required`。不再需要人工点登录页，但真掉线仍需人工扫码（Xvfb 不可见）。
 - **Muse 消费端生产全量上线与手写排班表视觉验收 (`docs/INTEGRATIONS.md`)**：
   - 消费端 `fetch_wechat.py` 启用 `--media`（带 `media=image&ocr=none`）与自动落盘/生命周期清理；

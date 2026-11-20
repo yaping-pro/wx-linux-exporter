@@ -31,6 +31,7 @@ if [[ -z "${WX_HOME}" ]]; then
 fi
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/systemd" && pwd)"
+HOST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/host" && pwd)"
 DEST_DIR="/etc/systemd/system"
 
 echo "== wx-linux-exporter systemd install =="
@@ -64,6 +65,15 @@ sudo systemctl enable --now wechat-export-api.service
 # Media enrichment worker (optional layer). Safe to enable unconditionally:
 # it is a no-op until config/media_policy.json sets "enabled": true.
 sudo systemctl enable --now wechat-media.timer
+
+# Host-side operator scripts -> /usr/local/bin (idempotent). These are the
+# redmi-wxpad probes/guards/toggles; they are NOT systemd units, so they are
+# installed here so a single `install-systemd.sh` run provisions everything.
+for f in redmi-tailnet-keepalive wechat-login-guard wxpad-export-toggle; do
+  if [[ -f "${HOST_DIR}/${f}" ]]; then
+    sudo install -m 0755 "${HOST_DIR}/${f}" /usr/local/bin/
+  fi
+done
 
 echo "== systemd units installed and enabled for user ${WX_USER} =="
 echo "   note: wechat-media.timer is a NO-OP until config/media_policy.json sets \\"enabled\\": true"

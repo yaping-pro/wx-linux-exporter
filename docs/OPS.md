@@ -3,6 +3,8 @@
 本文只讲**链路可用性**：手机（redmi-wxpad）→ tailnet → linux1 消费者。
 数据面契约见 [`DATA_CONTRACT.md`](DATA_CONTRACT.md)，部署见 [`DEPLOY.md`](DEPLOY.md)。
 
+> **状态（2026-11-20）：导出监控与告警已暂停，可一键恢复。** 青龙 `wx_export_check`（id8）、host `redmi-tailnet-keepalive.timer`、手机 `sfa_watchdog.sh` 三项已停用；**导出能力未下线**——`wx_daemon`（监听 `127.0.0.1:8765`）与 `wx_watchdog.sh` / `wx_autostart.sh`、微信本体保持运行。本文其余章节（时序、部署、守卫）保留为可用与恢复依据；up/down runbook 见 [§5.1](#51-状态变更与恢复2026-11-20)。
+
 ## 1. 角色
 
 | 位置 | 组件 | 职责 |
@@ -78,6 +80,30 @@ $A shell 'su -c "cp -a /data/adb/service.d/sfa_watchdog.sh /data/local/tmp/$(dat
 |---|---|---|---|
 | 2026-10-23 | 青龙 3 轮超时，`tx` 有量 `rx` 为 0 | WiFi 重连后 tailscaled 持有陈旧 direct endpoint；设备看门狗只校验进程/tun0 | 设备侧加 tailnet 探测 + 冷却重启；host 侧加 keepalive |
 | 2026-11-04 | 92 分钟不可用，探针连续 95 轮失败 | 19:50 重启后 SFA 在 **FBE 锁屏态** 被盲拉，7 连崩且 `SQLITE_CANTOPEN`；600s 退避又把 21:22:58 的解锁晾到 21:29 | 解锁门禁 + 退避上限 30s + host nudge 改为真实 `am start-foreground-service` |
+
+### 5.1 状态变更与恢复（2026-11-20）
+
+**定性**：暂停**导出监控与告警**，**不是**下线导出能力。手机侧 `wx_daemon`、`wx_watchdog.sh`、`wx_autostart.sh` 与微信本体**保持运行**。
+
+一键切换（host 侧 [`deploy/host/wxpad-export-toggle`](../deploy/host/wxpad-export-toggle)，随 [`deploy/install-systemd.sh`](../deploy/install-systemd.sh) 装到 `/usr/local/bin/`）：
+
+```bash
+wxpad-export-toggle status   # 只读：报告监控层三项 + 顺带报告导出本体 wx_daemon（本工具不管理它）
+wxpad-export-toggle down     # 暂停监控层（青龙自检 + host 探针 + 手机隧道守护）
+wxpad-export-toggle up       # 启用三项，恢复监控
+```
+
+`up` / `down` / `status` **幂等、可逆**；本工具**只**切换监控层三项，**绝不触碰导出能力本体**。它分别切换：
+
+| 组件 | down | up |
+|---|---|---|
+| 青龙 `wx_export_check`（id8） | `PUT /open/crons/disable [8]`（`Crontabs.isDisabled=1`） | `PUT /open/crons/enable [8]` |
+| host `redmi-tailnet-keepalive.timer` | `systemctl disable --now redmi-tailnet-keepalive.timer`（disabled / inactive） | `systemctl enable --now redmi-tailnet-keepalive.timer` |
+| phone `sfa_watchdog.sh` | 改名 `…/service.d/sfa_watchdog.sh.disabled` 并 kill 常驻进程 | 改回 `sfa_watchdog.sh` 并 `setsid nohup sh …` 重启看门狗 |
+
+路径/标识可用 `WXPAD_*` 环境变量覆盖（测试与迁移 seam，见脚本头部）。回归测试 [`tests/test_export_toggle.py`](../tests/test_export_toggle.py)（`python3 tests/test_export_toggle.py`，5 例，stub PATH 驱动 up/down/status 状态机）。
+
+保留未删：青龙脚本与日志、`redmi-tailnet-keepalive.{service,timer}` 与 `/usr/local/bin/redmi-tailnet-keepalive`、手机备份 `/data/local/tmp/sfa_watchdog.sh.disabled-20261120-142617`。
 
 ## 6. 已知限制（不要用"自动恢复"承诺掩盖）
 
