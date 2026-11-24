@@ -81,11 +81,22 @@ SKELETON_FRAC_LO_MAX = 0.70     # fraction of pixels < 70
 SKELETON_TRANS_MAX = 8.0        # mean horizontal transitions per row
 
 # --- OCR gate ----------------------------------------------------------------
-BUTTON_LABEL = "进入微信"
-VETO_PHRASES = ("扫码登录", "切换账号", "仅传输文件")
+# The resume panel's button label depends on the client's UI language: the live
+# host renders English ("Enter Weixin", 11 px tall) while the calibration shot was
+# Chinese. Both spellings are accepted; a wrong label only means "no click".
+BUTTON_LABELS = ("进入微信", "EnterWeixin", "EnterWeChat")
+# QR-page-only markers. The "Switch Account" / "Transfer files only" links are NOT
+# here: the resume panel shows them too (observed 2026-11-24), so vetoing on them
+# would block every legitimate click. The pixel classifier remains the hard veto.
+VETO_PHRASES = ("扫码", "二维码", "Scan")
 OCR_MAX_SUBSTITUTIONS = 1       # accept one garbled character in a phrase
 OCR_PSM_WHOLE = "6"             # uniform block of text
 OCR_PSM_BUTTON = "7"            # single line
+# The button label is light text on the brand-green bar, only ~11 px tall: raw
+# grayscale OCR reads nothing. Bilinear upscaling + a hard threshold yields
+# "Enter Weixin" exactly (measured 2026-11-24 on the live panel).
+OCR_UPSCALE = 8
+OCR_BINARIZE_THRESHOLD = 150
 
 # --- rate limits -------------------------------------------------------------
 MAX_CLICKS_PER_BOOT = 3
@@ -286,7 +297,10 @@ def fuzzy_contains(haystack: str, phrase: str,
 def interpret_ocr(whole_text: str, button_text: str) -> OcrResult:
     whole = normalize_ocr(whole_text)
     button = normalize_ocr(button_text)
-    label_found = fuzzy_contains(button, BUTTON_LABEL) or fuzzy_contains(whole, BUTTON_LABEL)
+    label_found = any(
+        fuzzy_contains(button, label) or fuzzy_contains(whole, label)
+        for label in BUTTON_LABELS
+    )
     vetoes = tuple(p for p in VETO_PHRASES if fuzzy_contains(whole, p))
     return OcrResult(
         text=whole_text.replace("\n", " ").strip(),
@@ -441,6 +455,56 @@ def capture_window_frame(display: str, geom: WindowGeometry) -> bytes | None:
     return result.stdout
 
 
+def enhance_for_ocr(region: bytes, width: int, height: int,
+                    scale: int = OCR_UPSCALE,
+                    threshold: int = OCR_BINARIZE_THRESHOLD) -> tuple[bytes, int, int]:
+    """Bilinear `scale`x upscale, then hard-threshold to black/white.
+
+    Small UI text (11 px, light-on-green) is invisible to tesseract at native size;
+    smoothed upscaling plus a threshold is what makes "Enter Weixin" readable.
+    Pure stdlib: the production host has no PIL/numpy.
+    """
+    if width <= 0 or height <= 0 or scale <= 0:
+        return region, width, height
+    out_w, out_h = width * scale, height * scale
+    # Horizontal pass: interpolate each source row to out_w columns.
+    tmp = bytearray(out_w * height)
+    xs = []
+    for ox in range(out_w):
+        sx = (ox + 0.5) / scale - 0.5
+        x0 = int(math.floor(sx))
+        frac = sx - x0
+        x0 = min(max(x0, 0), width - 1)
+        x1 = min(x0 + 1, width - 1)
+        xs.append((x0, x1, frac))
+    for y in range(height):
+        row_base = y * width
+        out_base = y * out_w
+        for ox, (x0, x1, frac) in enumerate(xs):
+            a = region[row_base + x0]
+            b = region[row_base + x1]
+            value = int(a + (b - a) * frac + 0.5)
+            tmp[out_base + ox] = 0 if value < 0 else 255 if value > 255 else value
+    # Vertical pass: interpolate columns, threshold on the way out.
+    out = bytearray(out_w * out_h)
+    for oy in range(out_h):
+        sy = (oy + 0.5) / scale - 0.5
+        y0 = int(math.floor(sy))
+        frac = sy - y0
+        y0 = min(max(y0, 0), height - 1)
+        y1 = min(y0 + 1, height - 1)
+        base0 = y0 * out_w
+        base1 = y1 * out_w
+        out_base = oy * out_w
+        for ox in range(out_w):
+            a = tmp[base0 + ox]
+            b = tmp[base1 + ox]
+            value = int(a + (b - a) * frac + 0.5)
+            value = 0 if value < 0 else 255 if value > 255 else value
+            out[out_base + ox] = 255 if value > threshold else 0
+    return bytes(out), out_w, out_h
+
+
 def write_pgm(path: str, region: bytes, width: int, height: int) -> bool:
     try:
         with open(path, "wb") as handle:
@@ -481,7 +545,8 @@ def read_ocr(frame: bytes, geom: WindowGeometry, lang: str,
         return None, OCR_STATUS_FAILED
     whole_path = os.path.join(workdir, "frame-whole.pgm")
     button_path = os.path.join(workdir, "frame-button.pgm")
-    if not write_pgm(whole_path, *whole) or not write_pgm(button_path, *button):
+    if not write_pgm(whole_path, *whole) or not write_pgm(
+            button_path, *enhance_for_ocr(*button)):
         return None, OCR_STATUS_FAILED
     whole_text = ocr_pgm(whole_path, lang, OCR_PSM_WHOLE)
     button_text = ocr_pgm(button_path, lang, OCR_PSM_BUTTON)

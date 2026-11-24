@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 ### Fixed
+- **`wechat-login-guard` 在英文 UI 下永远不点 (`deploy/host/wechat-login-guard`, `tests/test_wechat_login_guard.py`, `docs/OPS.md` §7)**：linux1 的微信客户端跑英文界面，残留会话面板的按钮是「Enter Weixin」，而守卫的 OCR 只认「进入微信」，于是每轮都判定 `ocr_no_label`、面板连续数小时等人（2026-11-24 复现）。同时发现按钮标签是 ~11px 浅色小字叠在品牌绿条上，原生分辨率 tesseract 读不出（实测 8 倍双线性放大 + 阈值 150 才能读出 `Enter Weixin`）。修复三处：(1) 标签集合扩为「进入微信」/「Enter Weixin」/「Enter WeChat」；(2) 按钮区域 OCR 前做纯 stdlib 的双线性放大+二值化预处理；(3) 否决词收紧为二维码页专属的「扫码」/「二维码」/`Scan`——`Switch Account`/`Transfer files only`（及中文「切换账号」/「仅传输文件」）在残留会话面板同样存在，继续当否决词会把所有合法点击拦死。像素分类器仍是硬否决。已在真机验证：`--check` → `action=would_click`，实跑 → `event=click_restored`（`292x396+494+202` → `917x668+181+67`）。
 - **`wechat-decrypt.timer` 重启后永久静默 (`deploy/systemd/wechat-decrypt.timer`, `tests/test_systemd_units.py`)**：生产主机曾用 `OnUnitActiveSec=` 空赋值（后接 `=5min`）追加 5 分钟节拍——空赋值是**列表重置**，会清空该 timer 的**全部**触发项（含 `OnCalendar`/`OnBootSec`）。主机 2026-11-08 22:46 重启后 `next_elapse=infinity`，vault 索引静默冻结 23 小时，而导出 API 仍返回 200 + 新鲜 watermark（契约规定无新消息时水位退化为 `range.to`），消费端无从察觉。仓库单元改为 `OnCalendar=*:0/5` + `OnBootSec=5min` + `Persistent=true`，并新增静态守卫测试禁止 timer 中出现空值触发项、要求每个 timer 至少有一个重启无关的触发项。
 
 ### Changed

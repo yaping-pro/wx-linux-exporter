@@ -249,8 +249,47 @@ class OcrTextTest(unittest.TestCase):
 
     def test_ocr_result_reports_veto(self):
         result = guard.interpret_ocr("请扫码登录", "进入微信")
-        self.assertIn("扫码登录", result.veto_hits)
+        self.assertIn("扫码", result.veto_hits)
         self.assertTrue(result.label_found)
+
+    def test_english_resume_panel_label_is_clickable(self):
+        """2026-11-24: the live host renders the English UI ("Enter Weixin")."""
+        ocr = guard.interpret_ocr(
+            "Weixin   x Switch Account Transfer files only", "Enter Weixin")
+        self.assertTrue(ocr.label_found)
+        self.assertEqual(ocr.veto_hits, ())
+        decision = guard.decide(pane_geometry(), stats_of(skeleton_frame()), ocr)
+        self.assertTrue(decision.click)
+
+    def test_resume_panel_links_are_not_vetoes(self):
+        """Switch Account / Transfer files only also sit on the resume panel, so
+        they must never veto a click (only the QR-page markers may)."""
+        for text in ("Switch Account Transfer files only", "切换账号 仅传输文件"):
+            ocr = guard.interpret_ocr(text, "进入微信")
+            self.assertEqual(ocr.veto_hits, (), text)
+
+    def test_english_qr_page_is_vetoed(self):
+        ocr = guard.interpret_ocr(
+            "Scan QR code with WeChat to log in Switch Account", "Enter Weixin")
+        self.assertIn("Scan", ocr.veto_hits)
+        decision = guard.decide(pane_geometry(), stats_of(skeleton_frame()), ocr)
+        self.assertEqual(decision.event, "ocr_veto")
+
+
+class OcrPreprocessTest(unittest.TestCase):
+    def test_upscale_and_binarize(self):
+        region = bytes([0, 250, 0, 250])  # 2x2: one bright pixel
+        out, w, h = guard.enhance_for_ocr(region, 2, 2, scale=4, threshold=150)
+        self.assertEqual((w, h), (8, 8))
+        self.assertEqual(len(out), 64)
+        self.assertEqual(set(out), {0, 255})
+        self.assertGreater(out.count(255), 0)
+        self.assertLess(out.count(255), 64)
+
+    def test_no_scale_is_identity(self):
+        region = bytes([0, 250, 0, 250])
+        out, w, h = guard.enhance_for_ocr(region, 2, 2, scale=0)
+        self.assertEqual((out, w, h), (region, 2, 2))
 
 
 class DecideTest(unittest.TestCase):
@@ -283,7 +322,7 @@ class DecideTest(unittest.TestCase):
         self.assertTrue(decision.human)
 
     def test_ocr_veto_phrase_blocks_click(self):
-        ocr = guard.interpret_ocr("切换账号", "进入微信")
+        ocr = guard.interpret_ocr("请扫码登录", "进入微信")
         decision = guard.decide(pane_geometry(), stats_of(skeleton_frame()), ocr)
         self.assertFalse(decision.click)
         self.assertEqual(decision.event, "ocr_veto")
