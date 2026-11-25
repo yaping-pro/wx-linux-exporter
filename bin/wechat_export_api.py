@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -46,11 +49,39 @@ except ImportError:
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 
+# Bounded SQLite busy timeout (mirrors the deployed 11-10 build). The vault is a
+# read-only snapshot published atomically every 5 minutes by another process; a
+# bounded wait avoids both instant "database is locked" failures and unbounded
+# stalls in a request thread.
+SQLITE_BUSY_TIMEOUT_SEC = 5.0
+
+# Per-socket-operation timeout for accepted connections. 30s bounds the single
+# blocking readline() in handle_one_request() (and stalled chunked writes)
+# without limiting the total duration of a long export, which is CPU-bound.
+CLIENT_SOCKET_TIMEOUT_SEC = 30.0
+
+# accept() backlog. Must reach listen() at bind time, hence a class attribute.
+LISTEN_BACKLOG = 64
+
 # 家服巡检简报快照：由 /home/steven/.agents/scripts/generate-report.py 每日
 # 09:00 生成简报时原子写入，本服务只读转发（不触发采集、不修改简报）。
 DEFAULT_BRIEFING_PATH = os.environ.get(
     "HOMELAB_BRIEFING_PATH", "/var/lib/homelab-inspector/briefing.json"
 )
+
+# 滚动 6 小时导出快照：由 wechat-decrypt 触发后原子写入，提供亚毫秒免锁只读响应。
+DEFAULT_SNAPSHOT_PATH = os.environ.get(
+    "WECHAT_ROLLING_SNAPSHOT_PATH", "/var/lib/wechat-export/rolling-6h.json"
+)
+DEFAULT_SNAPSHOT_LOCK = os.environ.get(
+    "WECHAT_ROLLING_SNAPSHOT_LOCK", "/var/lib/wechat-export/.snapshot.lock"
+)
+
+# generate_rolling_snapshot() outcomes. The two skip statuses are benign: the
+# decrypt sync skipped as well, so the systemd unit must not be marked failed.
+SNAPSHOT_OK = "ok"
+SNAPSHOT_SKIP_LOCKED = "skipped-locked"
+SNAPSHOT_SKIP_VAULT_NOT_READY = "skipped-vault-not-ready"
 
 # ── 媒体富化（可选，默认关闭）──────────────────────────────────────────────────
 # 设计原则：不新增响应字段、不新增端点、不改任何既有键名。
@@ -216,9 +247,9 @@ def _snapshot_message_stats(snapshot_dir: Path) -> tuple[int, float | None]:
         try:
             try:
                 uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
-                con = sqlite3.connect(uri, uri=True)
+                con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
             except Exception:
-                con = sqlite3.connect(str(shard))
+                con = sqlite3.connect(str(shard), timeout=SQLITE_BUSY_TIMEOUT_SEC)
             tables = [
                 r[0]
                 for r in con.execute(
@@ -454,9 +485,9 @@ def load_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
 
     uri = f"{contact_path.resolve().as_uri()}?mode=ro&immutable=1"
     try:
-        con = sqlite3.connect(uri, uri=True)
+        con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
     except Exception:
-        con = sqlite3.connect(str(contact_path))
+        con = sqlite3.connect(str(contact_path), timeout=SQLITE_BUSY_TIMEOUT_SEC)
 
     try:
         cursor = con.execute("PRAGMA table_info(contact)")
@@ -519,9 +550,9 @@ def get_cached_contacts(vault_dir: Path) -> dict[str, dict[str, Any]]:
     if s_path.exists():
         try:
             uri = f"{s_path.resolve().as_uri()}?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True)
+            con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
         except Exception:
-            con = sqlite3.connect(str(s_path))
+            con = sqlite3.connect(str(s_path), timeout=SQLITE_BUSY_TIMEOUT_SEC)
         try:
             cursor = con.execute("PRAGMA table_info(SessionTable)")
             cols = {r[1].lower(): r[1] for r in cursor.fetchall()}
@@ -585,9 +616,9 @@ def fetch_message_context(
     for shard in shards:
         try:
             uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True)
+            con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
         except Exception:
-            con = sqlite3.connect(str(shard))
+            con = sqlite3.connect(str(shard), timeout=SQLITE_BUSY_TIMEOUT_SEC)
         try:
             cur = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
             if cur.fetchone():
@@ -602,9 +633,9 @@ def fetch_message_context(
     n2id: dict[int, str] = {}
     try:
         uri = f"{target_shard.resolve().as_uri()}?mode=ro&immutable=1"
-        con = sqlite3.connect(uri, uri=True)
+        con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
     except Exception:
-        con = sqlite3.connect(str(target_shard))
+        con = sqlite3.connect(str(target_shard), timeout=SQLITE_BUSY_TIMEOUT_SEC)
 
     try:
         cur = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'")
@@ -750,9 +781,9 @@ def export_wechat_data(
     for shard in shards:
         try:
             uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True)
+            con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
         except Exception:
-            con = sqlite3.connect(str(shard))
+            con = sqlite3.connect(str(shard), timeout=SQLITE_BUSY_TIMEOUT_SEC)
 
         try:
             cursor = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'")
@@ -780,9 +811,9 @@ def export_wechat_data(
         n2id = name2id_by_shard.get(shard, {})
         try:
             uri = f"{shard.resolve().as_uri()}?mode=ro&immutable=1"
-            con = sqlite3.connect(uri, uri=True)
+            con = sqlite3.connect(uri, timeout=SQLITE_BUSY_TIMEOUT_SEC, uri=True)
         except Exception:
-            con = sqlite3.connect(str(shard))
+            con = sqlite3.connect(str(shard), timeout=SQLITE_BUSY_TIMEOUT_SEC)
 
         try:
             tables = [
@@ -1078,16 +1109,151 @@ def export_wechat_data(
     return response_payload
 
 
+def generate_rolling_snapshot(
+    config_path: Path | str | None = None,
+    output_path: Path | str | None = None,
+    window_hours: float = 6.0,
+    lock_path: Path | str | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Generates a pre-aggregated 6-hour export snapshot and writes it atomically.
+
+    Returns ``(status, payload)`` where status is SNAPSHOT_OK (payload is the
+    export result), SNAPSHOT_SKIP_LOCKED (another run holds the lock) or
+    SNAPSHOT_SKIP_VAULT_NOT_READY (no decrypted messages yet); payload is None
+    for both skips. Real failures (corrupt config, export/write errors) raise,
+    so callers cannot mistake them for a benign skip.
+    """
+    default_cfg = MEDIA_VAULT_ROOT / "config" / "export_service.json"
+    cfg_file = Path(config_path or default_cfg).expanduser()
+    cfg: dict[str, Any] = {}
+    if cfg_file.is_file():
+        try:
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            # A corrupt config must fail the worker instead of silently falling
+            # back to default paths (which would publish from/skip for the wrong
+            # vault and look like a benign skip).
+            raise RuntimeError(f"Failed to load config {cfg_file}: {e}") from e
+        if not isinstance(cfg, dict):
+            raise RuntimeError(f"Config file must contain a JSON object: {cfg_file}")
+
+    out_file = Path(output_path or cfg.get("snapshot_path") or DEFAULT_SNAPSHOT_PATH).expanduser()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Concurrency control via file lock
+    lpath = Path(lock_path or cfg.get("snapshot_lock") or DEFAULT_SNAPSHOT_LOCK).expanduser()
+    lpath.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(lpath), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        sys.stderr.write(f"[INFO] Another snapshot generation is in progress (lock {lpath}), skipping.\n")
+        os.close(lock_fd)
+        return SNAPSHOT_SKIP_LOCKED, None
+
+    try:
+        vault_dir = Path(cfg.get("vault_dir", "~/.local/share/wechat-vault/decrypted/current")).expanduser()
+        if not (vault_dir / "message").is_dir():
+            sys.stderr.write(
+                f"[WARN] Vault not ready: decrypted message dir not found "
+                f"({vault_dir / 'message'}), skipping.\n"
+            )
+            return SNAPSHOT_SKIP_VAULT_NOT_READY, None
+
+        now_epoch = time.time()
+        to_epoch = now_epoch
+        since_epoch = now_epoch - float(window_hours) * 3600.0
+
+        allowlist = cfg.get("allowlist", [])
+        blocklist = cfg.get("blocklist", [])
+
+        # Reuse the repo's current export implementation (pagination/watermark/media
+        # semantics) instead of re-implementing the export path here.
+        result = export_wechat_data(
+            vault_dir=vault_dir,
+            since_epoch=since_epoch,
+            to_epoch=to_epoch,
+            allowlist=allowlist,
+            blocklist=blocklist,
+            server_context=cfg,
+            media_filter="image",
+            ocr_mode="none",
+            limit=0,
+            cursor_tuple=None,
+        )
+
+        # Byte-compatible schema plus staleness tracking fields
+        gen_rfc = format_rfc3339(now_epoch)
+        since_rfc = format_rfc3339(since_epoch)
+        to_rfc = format_rfc3339(to_epoch)
+
+        # Place generated_at, since, to at top for fast header inspection
+        enriched_result = {
+            "generated_at": gen_rfc,
+            "since": since_rfc,
+            "to": to_rfc,
+            **result,
+        }
+
+        body_bytes = json.dumps(enriched_result, ensure_ascii=False, indent=2).encode("utf-8")
+
+        # Atomic write: temp file in same directory + replace
+        tmp_file = out_file.parent / f".tmp_{out_file.name}_{os.getpid()}_{int(now_epoch)}"
+        with open(tmp_file, "wb") as f:
+            f.write(body_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_file, out_file)
+        sys.stderr.write(
+            f"[INFO] Rolling snapshot generated at {out_file} "
+            f"(size={len(body_bytes)} bytes, messages={result['payload_stats']['messages']}, "
+            f"window={window_hours}h, generated_at={gen_rfc})\n"
+        )
+        return SNAPSHOT_OK, result
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
 class WeChatExportHandler(BaseHTTPRequestHandler):
     """HTTP request handler for WeChat export API."""
+
+    # StreamRequestHandler.setup() applies this to the accepted socket via
+    # self.connection.settimeout(self.timeout). It bounds each blocking socket
+    # operation, not the whole request, so long chunked exports are unaffected.
+    timeout = CLIENT_SOCKET_TIMEOUT_SEC
 
     def __init__(self, *args: Any, server_context: dict[str, Any] | None = None, **kwargs: Any) -> None:
         self.server_context = server_context or {}
         super().__init__(*args, **kwargs)
 
     def log_message(self, format: str, *args: Any) -> None:
-        """Custom log message formatting."""
-        sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
+        """Custom log message formatting.
+
+        Includes the client address so journal logs can distinguish the local
+        docker container (172.x) from tailnet peers (100.x). The address is read
+        defensively: logging must never raise and abort request handling, and
+        client_address may be unavailable in very early error paths.
+        Never logs Authorization headers or tokens.
+        """
+        try:
+            addr = self.client_address
+            source = f"{addr[0]}:{addr[1]}"
+        except Exception:
+            source = "-"
+        try:
+            message = format % args
+        except Exception:
+            message = format
+        try:
+            sys.stderr.write(f"[{self.log_date_time_string()}] [{source}] {message}\n")
+        except Exception:
+            pass
 
     def send_json(self, status_code: int, data: dict[str, Any]) -> None:
         """Send a JSON HTTP response."""
@@ -1180,6 +1346,51 @@ class WeChatExportHandler(BaseHTTPRequestHandler):
                 self.send_json(503, {"error": "Briefing snapshot not available yet"})
             except (OSError, ValueError) as e:
                 self.send_json(500, {"error": f"Failed to read briefing snapshot: {e}"})
+            return
+
+        if path == "/api/wechat/export/rolling":
+            # 与 /api/wechat/export 同一套 Bearer 鉴权
+            if not self.check_auth():
+                self.send_json(401, {"error": "Unauthorized"})
+                return
+
+            snapshot_path = Path(
+                self.server_context.get("snapshot_path") or DEFAULT_SNAPSHOT_PATH
+            ).expanduser()
+
+            if not snapshot_path.is_file():
+                self.send_json(503, {
+                    "error": {
+                        "code": "snapshot_unavailable",
+                        "message": "Rolling export snapshot not available yet",
+                        "path": str(snapshot_path),
+                    }
+                })
+                return
+
+            try:
+                stat = snapshot_path.stat()
+                file_size = stat.st_size
+
+                # Fast extract generated_at from the first 2KB of the file
+                header_gen_at = None
+                with open(snapshot_path, "rb") as f:
+                    header_chunk = f.read(2048)
+                    m = re.search(rb'"generated_at":\s*"([^"]+)"', header_chunk)
+                    if m:
+                        header_gen_at = m.group(1).decode("utf-8")
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(file_size))
+                if header_gen_at:
+                    self.send_header("X-Snapshot-Generated-At", header_gen_at)
+                self.end_headers()
+
+                with open(snapshot_path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, length=65536)
+            except Exception as e:
+                self.send_json(500, {"error": f"Failed to stream rolling snapshot: {e}"})
             return
 
         if path == "/api/wechat/export":
@@ -1732,6 +1943,7 @@ def create_server(
     allowlist: list[str] | None = None,
     blocklist: list[str] | None = None,
     briefing_path: str | None = None,
+    snapshot_path: str | None = None,
     media_vault_root: str | None = None,
     media_policy_path: str | None = None,
     media_ledger_path: str | None = None,
@@ -1744,6 +1956,7 @@ def create_server(
         "allowlist": allowlist or [],
         "blocklist": blocklist or [],
         "briefing_path": briefing_path or DEFAULT_BRIEFING_PATH,
+        "snapshot_path": snapshot_path or DEFAULT_SNAPSHOT_PATH,
         "media_vault_root": media_vault_root,
         "media_policy_path": media_policy_path,
         "media_ledger_path": media_ledger_path,
@@ -1754,10 +1967,16 @@ def create_server(
     except ImportError:
         server_class = HTTPServer
 
+    # TCPServer.__init__ calls server_bind()/server_activate(), and the latter
+    # calls listen(self.request_queue_size) immediately. Assigning the value to
+    # the instance afterwards would be ignored, so it must be a class attribute.
+    class _ConfiguredHTTPServer(server_class):  # type: ignore[misc, valid-type]
+        request_queue_size = LISTEN_BACKLOG
+
     def handler_factory(*args: Any, **kwargs: Any) -> WeChatExportHandler:
         return WeChatExportHandler(*args, server_context=server_context, **kwargs)
 
-    server = server_class((host, port), handler_factory)
+    server = _ConfiguredHTTPServer((host, port), handler_factory)
     if hasattr(server, "daemon_threads"):
         server.daemon_threads = True
     return server
@@ -1793,8 +2012,55 @@ def main() -> None:
              "bound port can read all exported chat data. Use only on trusted loopback/dev. "
              "Required to start when no token is configured (fail-closed default otherwise).",
     )
+    parser.add_argument(
+        "--generate-snapshot",
+        action="store_true",
+        help="Generate a rolling export snapshot to disk and exit (runs as worker). "
+             "Exit 0 on success or benign skip (lock held / vault not ready); "
+             "exit 1 on real failure.",
+    )
+    parser.add_argument(
+        "--snapshot-output",
+        type=str,
+        default=None,
+        help="Custom output path for the rolling snapshot.",
+    )
+    parser.add_argument(
+        "--window-hours",
+        type=float,
+        default=6.0,
+        help="Window size in hours for the rolling snapshot (default: 6.0).",
+    )
 
     args = parser.parse_args()
+
+    # Worker mode must run before the fail-closed token check: it never starts the
+    # HTTP server, so it needs no token.
+    if args.generate_snapshot:
+        try:
+            status, _payload = generate_rolling_snapshot(
+                config_path=args.config,
+                output_path=args.snapshot_output,
+                window_hours=args.window_hours,
+            )
+        except Exception as exc:
+            # Real failure: ExecStartPost must fail, with a greppable ERROR line
+            # plus the traceback in the journal for diagnosis.
+            sys.stderr.write(f"[ERROR] Rolling snapshot generation failed: {exc}\n")
+            traceback.print_exc()
+            sys.exit(1)
+        if status == SNAPSHOT_OK:
+            sys.exit(0)
+        if status in (SNAPSHOT_SKIP_LOCKED, SNAPSHOT_SKIP_VAULT_NOT_READY):
+            # Benign skips: another run holds the lock, or the vault has no
+            # decrypted messages yet (the decrypt sync skipped too). Failing the
+            # unit here would only paint a healthy sync red; the reason is
+            # already on stderr as an [INFO]/[WARN] line.
+            sys.exit(0)
+        # Fail closed on a status this worker does not understand instead of
+        # reporting success for something that produced no snapshot.
+        sys.stderr.write(f"[ERROR] Rolling snapshot returned unknown status: {status!r}\n")
+        sys.exit(1)
 
     config: dict[str, Any] = {
         "host": "127.0.0.1",
@@ -1867,6 +2133,7 @@ def main() -> None:
         auth_enabled=auth_enabled,
         allowlist=allowlist,
         blocklist=blocklist,
+        snapshot_path=config.get("snapshot_path"),
     )
 
     try:
