@@ -60,7 +60,7 @@ python3 bin/wechat_media.py --help
 本项目采用「只读提取密钥 → 离线解密分片副本 → 合并 WAL 增量帧 → 原子发布至 `decrypted/current`」的无损安全架构。
 
 ### 步骤 2.1 运行同步解密流水线
-运行项目提供的 `bin/wechat-sync.sh`（内部调度 `extract_keys.py` 与 `wechat_publish.py`）：
+运行项目提供的 `bin/wechat-sync.sh`（内部调度密钥工具与 `wechat_publish.py`）。密钥工具必须满足 `<tool> extract --db-dir <dir> --output <file>` 契约——默认按 `$KEY_TOOL` → `/opt/wcdb-key-tool/wcdb_key_tool.py` → `$VAULT_ROOT/bin/wcdb_key_tool.py` 顺序探测，**仓库自带的 macOS frida 工具 `bin/extract_keys.py` 不满足该契约，不会被选中**：
 ```bash
 bash bin/wechat-sync.sh
 ```
