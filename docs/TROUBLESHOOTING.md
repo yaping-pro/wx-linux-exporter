@@ -14,7 +14,10 @@
   3. 确认是否缺少桌面环境依赖：`sudo apt-get install -y libxss1 libappindicator3-1 libsecret-1-0`。
 
 ### 2. 密钥提取失败
-- **现象**：`wechat-sync.sh` 日志输出 `GDB attach timeout` 或 `Key not found`。
+- **现象 A**：`wechat-sync.sh` 日志里每轮出现 `extract_keys.py: error: unrecognized arguments: extract --db-dir … --output …`（`~/.local/share/wechat-vault/sync.log`）。
+  - 这是**工具契约不匹配**：同步脚本按 wcdb-key-tool 家族契约调用，而 macOS frida 工具 `bin/extract_keys.py` 的 CLI 是 `--targets/--db-base`。修好后的脚本只会选中 `--help` 里列出 `extract` 子命令的工具；若仍出现此报错，说明 `KEY_TOOL` 环境变量或 systemd unit 显式指向了不兼容工具，改指向 `/opt/wcdb-key-tool/wcdb_key_tool.py` 即可。
+  - 若日志出现 `未找到满足 … 契约的密钥工具`，则本轮**不刷新密钥**、沿用已有 `keys/all_keys.json`；密钥轮换（微信升级/重装）后必须补齐密钥工具，否则发布会在解密阶段失败。
+- **现象 B**：`wechat-sync.sh` 日志输出 `GDB attach timeout` 或 `Key not found`。
 - **排查**：
   1. 确认系统 ptrace 权限：检查 `/proc/sys/kernel/yama/ptrace_scope`，若为 1 或更高，可执行 `sudo sysctl kernel.yama.ptrace_scope=0` 临时放行。
   2. 确认微信是否处于已登录状态。若微信刚重启，尚未完成用户登录，则内存中尚未初始化加密密钥。
